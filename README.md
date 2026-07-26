@@ -22,6 +22,9 @@ Python 3.10+ and PyTorch 2.2+ are required. On the A100 machine, install the
 package and its data, tracking, and test extras:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -e '.[data,tracking,test]'
 python -m lm_cl.cli.inspect_environment
 ```
