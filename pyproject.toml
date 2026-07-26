@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lm-cl"
+version = "0.1.0"
+description = "Zyphra-style continual language-model plasticity experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+tracking = ["tensorboard>=2.15"]
+data = [
+  "datasets>=3,<5",
+  "huggingface-hub>=0.30",
+  "transformers>=4.51",
+]
+
+[project.scripts]
+lm-cl-validate-config = "lm_cl.cli.validate_config:main"
+lm-cl-parameter-count = "lm_cl.cli.parameter_count:main"
+lm-cl-synthetic-forward = "lm_cl.cli.synthetic_forward:main"
+lm-cl-inspect-environment = "lm_cl.cli.inspect_environment:main"
+lm-cl-validate-data-config = "lm_cl.cli.validate_data_config:main"
+lm-cl-inspect-tokenizer = "lm_cl.cli.inspect_tokenizer:main"
+lm-cl-inspect-culturax = "lm_cl.cli.inspect_culturax:main"
+lm-cl-stream-culturax = "lm_cl.cli.stream_culturax:main"
+lm-cl-materialize-stage = "lm_cl.cli.materialize_stage:main"
+lm-cl-inspect-manifest = "lm_cl.cli.inspect_manifest:main"
+lm-cl-validate-packed-shards = "lm_cl.cli.validate_packed_shards:main"
+lm-cl-clean-owned-cache = "lm_cl.cli.clean_owned_cache:main"
+lm-cl-validate-continual-config = "lm_cl.cli.validate_continual_config:main"
+lm-cl-train-continual = "lm_cl.cli.train_continual:main"
+lm-cl-resume-continual = "lm_cl.cli.resume_continual:main"
+lm-cl-inspect-checkpoint = "lm_cl.cli.inspect_checkpoint:main"
+lm-cl-evaluate-checkpoint = "lm_cl.cli.evaluate_checkpoint:main"
+lm-cl-compare-distributed-runs = "lm_cl.cli.compare_distributed_runs:main"
+lm-cl-validate-probe-config = "lm_cl.cli.validate_probe_config:main"
+lm-cl-run-probe = "lm_cl.cli.run_probe:main"
+lm-cl-resume-probe = "lm_cl.cli.resume_probe:main"
+lm-cl-inspect-probe-checkpoint = "lm_cl.cli.inspect_probe_checkpoint:main"
+lm-cl-inspect-probe-results = "lm_cl.cli.inspect_probe_results:main"
+lm-cl-compute-probe-auc = "lm_cl.cli.compute_probe_auc:main"
+lm-cl-compare-probes = "lm_cl.cli.compare_probes:main"
+lm-cl-compare-probe-checkpoints = "lm_cl.cli.compare_probe_checkpoints:main"
+lm-cl-validate-probe-data-pair = "lm_cl.cli.validate_probe_data_pair:main"
+lm-cl-prepare-experiment-data = "lm_cl.cli.prepare_experiment_data:main"
+lm-cl-launch-experiments = "lm_cl.cli.launch_experiments:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -1,0 +1,90 @@
+schema_version: 1
+
+experiment:
+  name: zyphra-fastmem-a100
+  output_root: ${LM_CL_OUTPUT_ROOT}
+  repository_root: ../..
+  seed: [81010]
+  models: [transformer, fastmem_rmt]
+  model_size: 5m
+  cycles: 2
+  tokens_per_task: 5000000000
+  token_budget_policy: floor_complete_sequences_v1
+  sequence_length: 2048
+  languages: [en, zh_written, fr, ja, es, de, pt, ru]
+  probe_schedule: cycle_end_after_ru
+  resume: auto
+  run_kind: production
+
+data:
+  mode: packed
+  manifest_root: ${LM_CL_DATA_ROOT}/generated/stages
+  manifest_template: zyphra-cycle-{cycle:04d}-{language}-task-{task_index:04d}-{effective_tokens}/manifest.json
+  cycle_manifest_policy: fresh_disjoint_v1
+  tokenizer_manifest: ${LM_CL_DATA_ROOT}/generated/tokenizers/qwen3/manifest.json
+  prepare_if_missing: true
+  dataset_cache_root: ${LM_CL_DATA_ROOT}/hf-cache
+  generated_root: ${LM_CL_DATA_ROOT}/generated
+  probe_training_manifest: ${LM_CL_DATA_ROOT}/generated/stages/zyphra-vi-probe-train-4999999488/manifest.json
+  probe_validation_manifest: ${LM_CL_DATA_ROOT}/generated/stages/zyphra-vi-validation-2621440/manifest.json
+  max_cache_bytes: 21474836480
+  max_generated_bytes: 1099511627776
+  max_temporary_bytes: 2147483648
+  max_input_documents: 5000000
+  max_runtime_seconds: 172800
+  shuffle_buffer_documents: 8192
+  document_order_seed: 31003
+  split_seed: 41001
+  validation_permyriad: 100
+  max_shard_tokens: 250000000
+
+training:
+  global_batch_sequences: 256
+  physical_microbatch_sequences: 32
+  device: cuda
+  precision: bf16
+  fp16_loss_conditioning_multiplier: 2
+  optimizer: adamw
+  peak_lr_5m: 0.003
+  peak_lr_12m: 0.0023
+  warmup_fraction: 0.05
+  checkpoint_frequency: 0
+  retain_last_checkpoints: 2
+  deterministic: true
+
+fastmem:
+  memory_tokens: 8
+  segment_length: 1024
+  fast_lr: 0.005
+  fast_clip: 1.0
+  slow_accumulation_k: 2
+
+launcher:
+  gpu_ids: [0, 1, 2, 3]
+  jobs_per_gpu: 1
+  gpus_per_job: 1
+  max_parallel_jobs: 4
+  start_method: subprocess
+  fail_fast: true
+  retry_count: 1
+  rendezvous_port_base: 29500
+  disk_free_floor_bytes: 21474836480
+  checkpoint_bytes_per_parameter: 20
+  checkpoint_fixed_overhead_bytes: 67108864
+
+tracking:
+  jsonl: true
+  tensorboard: true
+  tensorboard_flush_seconds: 30
+  log_every_batches: 10
+  save_summary_csv: true
+  save_summary_json: true
+
+probe:
+  enabled: true
+  mode: system
+  at_cycle_end: true
+  training_tokens: 5000000000
+  validation_sequences: 1280
+  evaluation_interval: 95
+  evaluation_milestones: [1, 2, 4, 8, 16, 32, 64, 95]

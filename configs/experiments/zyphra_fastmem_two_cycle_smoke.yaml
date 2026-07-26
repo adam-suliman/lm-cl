@@ -1,0 +1,90 @@
+schema_version: 1
+
+experiment:
+  name: zyphra-fastmem-two-cycle-gate-v2
+  output_root: runs/final-deliverable/smoke-results
+  repository_root: ../..
+  seed: [99101]
+  models: [transformer, fastmem_rmt]
+  model_size: tiny
+  cycles: 2
+  tokens_per_task: 32
+  token_budget_policy: floor_complete_sequences_v1
+  sequence_length: 16
+  languages: [en, zh_written, fr, ja, es, de, pt, ru]
+  probe_schedule: cycle_end_after_ru
+  resume: never
+  run_kind: functional_smoke
+
+data:
+  mode: synthetic
+  manifest_root: ""
+  manifest_template: ""
+  cycle_manifest_policy: fresh_disjoint_v1
+  tokenizer_manifest: ""
+  prepare_if_missing: false
+  dataset_cache_root: ""
+  generated_root: ""
+  probe_training_manifest: null
+  probe_validation_manifest: null
+  max_cache_bytes: 1048576
+  max_generated_bytes: 1048576
+  max_temporary_bytes: 1048576
+  max_input_documents: 1
+  max_runtime_seconds: 60
+  shuffle_buffer_documents: 1
+  document_order_seed: 99101
+  split_seed: 99102
+  validation_permyriad: 100
+  max_shard_tokens: 32
+
+training:
+  global_batch_sequences: 1
+  physical_microbatch_sequences: 1
+  device: cpu
+  precision: fp32
+  fp16_loss_conditioning_multiplier: 2
+  optimizer: adamw
+  peak_lr_5m: 0.001
+  peak_lr_12m: 0.001
+  warmup_fraction: 0.05
+  checkpoint_frequency: 0
+  retain_last_checkpoints: 2
+  deterministic: true
+
+fastmem:
+  memory_tokens: 8
+  segment_length: 8
+  fast_lr: 0.005
+  fast_clip: 1.0
+  slow_accumulation_k: 2
+
+launcher:
+  gpu_ids: []
+  jobs_per_gpu: 1
+  gpus_per_job: 0
+  max_parallel_jobs: 2
+  start_method: subprocess
+  fail_fast: true
+  retry_count: 1
+  rendezvous_port_base: 31500
+  disk_free_floor_bytes: 1073741824
+  checkpoint_bytes_per_parameter: 160
+  checkpoint_fixed_overhead_bytes: 1048576
+
+tracking:
+  jsonl: true
+  tensorboard: true
+  tensorboard_flush_seconds: 1
+  log_every_batches: 1
+  save_summary_csv: true
+  save_summary_json: true
+
+probe:
+  enabled: true
+  mode: system
+  at_cycle_end: true
+  training_tokens: 32
+  validation_sequences: 2
+  evaluation_interval: 1
+  evaluation_milestones: [1, 2]
