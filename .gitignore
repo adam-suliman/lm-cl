@@ -9,7 +9,7 @@ events.out.tfevents.*
 
 # Packed/generated data and caches
 generated/
-data/
+/data/
 hf-cache/
 hf-home/
 *.bin

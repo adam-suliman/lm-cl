@@ -587,6 +587,17 @@ def test_release_builder_excludes_internal_artifacts(tmp_path):
     ]
 
 
+def test_gitignore_does_not_hide_source_data_package():
+    rules = {
+        line.strip()
+        for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert "/data/" in rules
+    assert "data/" not in rules
+    assert (ROOT / "src/lm_cl/data/__init__.py").is_file()
+
+
 def test_exported_release_imports_and_cli_help(tmp_path):
     output = tmp_path / "release"
     subprocess.run(
