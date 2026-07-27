@@ -26,7 +26,9 @@ from lm_cl.data.materialize import (
     materialize_stage,
 )
 from lm_cl.data.packed import validate_packed_shards
+from lm_cl.data.registry import OverlapRegistry
 from lm_cl.data.storage import PeriodicDiskLimitGuard, ensure_owned_root
+from lm_cl.launcher.data import _merge_parallel_overlap_registries
 
 
 class BatchTokenizer:
@@ -279,6 +281,10 @@ def test_progress_reports_checkpoint_throughput(tmp_path, monkeypatch):
         (
             "afea355788a2782192511539c354853076414766af6f1bd0970f051c2a0dc3de",
             "contiguous_parquet_row_group_prefetch_performance_upgrade",
+        ),
+        (
+            "edbec7e64d2b02866840b420546e0515c16e37af28ad2fc55d4136fb1d466518",
+            "parallel_language_lane_preparation_performance_upgrade",
         ),
     ],
 )
@@ -566,3 +572,96 @@ def test_real_parquet_row_group_resharding_preserves_exact_order(
     config = _config(tmp_path, generated_name="row-group-stream")
     actual = list(huggingface_data.stream_culturax_rows(config))
     assert actual == rows
+
+
+def test_lane_registry_is_separate_and_manifest_is_merge_gated(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "LM_CL_OVERLAP_REGISTRY_NAMESPACE", "language-en"
+    )
+    config = _config(tmp_path, generated_name="lane-registry")
+    manifest = _run(config, BatchTokenizer())
+    generated = Path(config.storage.generated_root)
+    lane_registry = (
+        generated / "preparation-lanes/overlap-language-en.sqlite3"
+    )
+    assert lane_registry.is_file()
+    assert not (generated / "overlap.sqlite3").exists()
+    assert manifest["overlap_registry"] == {
+        "schema_version": 2,
+        "relative_path_from_stage": (
+            "../../preparation-lanes/overlap-language-en.sqlite3"
+        ),
+        "preparation_lane_namespace": "language-en",
+        "requires_global_merge": True,
+    }
+
+
+def test_parallel_lane_merge_preserves_identical_baseline_and_audits(
+    tmp_path,
+):
+    generated = tmp_path / "generated"
+    lane_root = generated / "preparation-lanes"
+    lane_root.mkdir(parents=True)
+
+    def insert(path, *, content, token, stage, language):
+        with OverlapRegistry(path) as registry:
+            registry.insert_prechecked(
+                content_sha256=content,
+                token_ids_sha256=token,
+                stage_id=stage,
+                purpose="continual_train",
+                language=language,
+                split="train",
+                source_id=f"source-{stage}",
+                document_index=0,
+                token_start=0,
+                token_end=10,
+            )
+            registry.commit()
+
+    en_lane = lane_root / "overlap-language-en.sqlite3"
+    fr_lane = lane_root / "overlap-language-fr.sqlite3"
+    global_registry = generated / "overlap.sqlite3"
+    insert(en_lane, content="a" * 64, token="b" * 64, stage="en-stage", language="en")
+    insert(fr_lane, content="c" * 64, token="d" * 64, stage="fr-stage", language="fr")
+    insert(
+        global_registry,
+        content="a" * 64,
+        token="b" * 64,
+        stage="en-stage",
+        language="en",
+    )
+
+    manifests = []
+    for language, stage in (("en", "en-stage"), ("fr", "fr-stage")):
+        path = generated / "stages" / stage / "manifest.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "manifest_content_sha256": language * 32,
+                    "ordered_data_sha256": stage * 8,
+                    "accepted_document_count": 1,
+                    "stage": {"stage_id": stage, "language": language},
+                    "overlap_registry": {
+                        "preparation_lane_namespace": f"language-{language}",
+                        "requires_global_merge": True,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifests.append(path)
+
+    config = types.SimpleNamespace(
+        data=types.SimpleNamespace(generated_root=str(generated))
+    )
+    audit = _merge_parallel_overlap_registries(config, manifests)
+    assert audit is not None
+    assert audit["status"] == "complete"
+    assert audit["cross_lane_conflicts"] == []
+    assert audit["global_registry"]["document_count"] == 2
+    with OverlapRegistry(global_registry) as registry:
+        assert registry.count() == 2

@@ -45,14 +45,16 @@ rendered path, manifest-file SHA-256, manifest-content SHA-256, ordered-data
 SHA-256, tokenizer identity, and requested/effective count is frozen in the
 resolved cycle×language matrix.
 
-The production `max_input_documents` value is 20,000,000. This is a fail-safe
+The production `max_input_documents` value is 30,000,000. This is a fail-safe
 execution ceiling, not a target: materialization stops as soon as the exact
 token budget is reached. The larger ceiling is required because observed
 English documents average fewer than 1,000 tokenizer tokens, making the former
 5,000,000-document ceiling unable to reach the frozen five-billion-token
-budget. Increasing an incomplete stage's ceiling is resume-compatible only
-through the explicitly audited migration; decreasing it or changing any other
-selection field remains an error.
+budget. Later cycles must additionally pass documents already registered by
+earlier cycles; 30,000,000 leaves headroom for all three appearances.
+Increasing an incomplete stage's ceiling is resume-compatible only through the
+explicitly audited migration; decreasing it or changing any other selection
+field remains an error.
 
 The tokenizer contract is fixed at base vocabulary 151,643, effective length
 151,669, maximum emitted ID 151,668, model embedding rows 151,680, and EOS/pad

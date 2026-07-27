@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import replace
@@ -73,6 +74,12 @@ LEGACY_ORDERED_MATERIALIZATION_MIGRATIONS = {
     "afea355788a2782192511539c354853076414766af6f1bd0970f051c2a0dc3de": (
         "contiguous_parquet_row_group_prefetch"
     ),
+    # Commit 9f3a94a adds deterministic row-group prefetch. Language-lane
+    # preparation changes only where the temporary overlap transaction is
+    # recorded; a checked global merge remains mandatory before launch.
+    "edbec7e64d2b02866840b420546e0515c16e37af28ad2fc55d4136fb1d466518": (
+        "parallel_language_lane_preparation"
+    ),
 }
 LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S = frozenset(
     LEGACY_ORDERED_MATERIALIZATION_MIGRATIONS
@@ -114,6 +121,9 @@ def materialization_performance_settings() -> dict[str, Any]:
         "engine_version": MATERIALIZATION_ENGINE_VERSION,
         "tokenizer_batch_documents": batch_size,
         "checkpoint_candidates_override": checkpoint_candidates,
+        "overlap_registry_namespace": os.environ.get(
+            "LM_CL_OVERLAP_REGISTRY_NAMESPACE"
+        ),
         "tokenizers_parallelism": os.environ.get(
             "TOKENIZERS_PARALLELISM", "unset"
         ),
@@ -147,6 +157,30 @@ def _source_tree_sha256() -> str:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _overlap_registry_paths(
+    generated_root: Path,
+) -> tuple[Path, Path, str | None]:
+    namespace = os.environ.get("LM_CL_OVERLAP_REGISTRY_NAMESPACE")
+    if namespace is None:
+        return (
+            generated_root / "overlap.sqlite3",
+            generated_root / ".overlap.lock",
+            None,
+        )
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", namespace):
+        raise ValueError(
+            "LM_CL_OVERLAP_REGISTRY_NAMESPACE must match "
+            "[a-z0-9][a-z0-9_-]{0,63}"
+        )
+    lane_root = generated_root / "preparation-lanes"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    return (
+        lane_root / f"overlap-{namespace}.sqlite3",
+        lane_root / f".overlap-{namespace}.lock",
+        namespace,
+    )
 
 
 def _package_versions() -> dict[str, str | None]:
@@ -739,7 +773,10 @@ def _materialize_stage(
     boundary_path = stage_dir / "boundaries.jsonl"
     runtime = RuntimeGuard(config.selection.max_runtime_seconds)
 
-    with FileLock(generated_root / ".overlap.lock"):
+    registry_path, registry_lock_path, registry_namespace = (
+        _overlap_registry_paths(generated_root)
+    )
+    with FileLock(registry_lock_path):
         state, already_complete = _load_or_initialize(
             config=config,
             tokenizer_manifest=tokenizer_manifest,
@@ -747,6 +784,15 @@ def _materialize_stage(
         )
         if already_complete:
             return state
+        state["overlap_registry"] = {
+            "schema_version": 2,
+            "relative_path_from_stage": os.path.relpath(
+                registry_path, stage_dir
+            ),
+            "preparation_lane_namespace": registry_namespace,
+            "requires_global_merge": registry_namespace is not None,
+        }
+        atomic_write_json(incomplete_path, state)
         writer = PackedShardWriter(
             stage_dir,
             max_shard_tokens=config.packing.max_shard_tokens,
@@ -765,7 +811,7 @@ def _materialize_stage(
         counters: dict[str, int] = {}
         skip_selected = int(state["selected_document_count"])
         try:
-            with OverlapRegistry(generated_root / "overlap.sqlite3") as registry:
+            with OverlapRegistry(registry_path) as registry:
                 registered_count = registry.count_for_stage(
                     config.stage.stage_id
                 )

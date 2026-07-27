@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +26,8 @@ from lm_cl.config.data_schema import (
 )
 from lm_cl.config.data_yaml import save_data_pipeline_config
 from lm_cl.data.packed import load_packed_manifest, validate_packed_shards
+from lm_cl.data.registry import OverlapRegistry
+from lm_cl.data.storage import atomic_write_json
 from lm_cl.data.tokenizer import (
     load_tokenizer_manifest,
     sha256_file,
@@ -51,6 +57,243 @@ LANGUAGE_CONFIGS = {
     "ru": "ru",
     "vi": "vi",
 }
+
+
+def _lane_namespace(language: str) -> str:
+    return f"language-{language.replace('_', '-')}"
+
+
+def _lane_registry_path(generated_root: Path, language: str) -> Path:
+    return (
+        generated_root
+        / "preparation-lanes"
+        / f"overlap-{_lane_namespace(language)}.sqlite3"
+    )
+
+
+def _checkpoint_sqlite(path: Path) -> None:
+    if not path.is_file():
+        return
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+
+
+def _rows_differ_clause(left: str, right: str) -> str:
+    columns = (
+        "content_sha256",
+        "token_ids_sha256",
+        "stage_id",
+        "purpose",
+        "language",
+        "split_name",
+        "source_id",
+        "document_index",
+        "token_start",
+        "token_end",
+    )
+    return " OR ".join(
+        f"{left}.{column} IS NOT {right}.{column}" for column in columns
+    )
+
+
+def _parallel_manifest_records(
+    manifest_paths: list[Path],
+) -> list[dict[str, Any]]:
+    records = []
+    for path in manifest_paths:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        overlap = manifest.get("overlap_registry", {})
+        namespace = overlap.get("preparation_lane_namespace")
+        if namespace is None:
+            continue
+        if overlap.get("requires_global_merge") is not True:
+            raise ValueError(f"Lane manifest lacks global-merge gate: {path}")
+        records.append(
+            {
+                "path": str(path),
+                "manifest_file_sha256": sha256_file(path),
+                "manifest_content_sha256": manifest[
+                    "manifest_content_sha256"
+                ],
+                "ordered_data_sha256": manifest["ordered_data_sha256"],
+                "stage_id": manifest["stage"]["stage_id"],
+                "language": manifest["stage"]["language"],
+                "lane_namespace": namespace,
+                "accepted_document_count": int(
+                    manifest["accepted_document_count"]
+                ),
+            }
+        )
+    return records
+
+
+def _parallel_audit_is_current(
+    audit_path: Path,
+    records: list[dict[str, Any]],
+    global_registry: Path,
+) -> bool:
+    if not audit_path.is_file() or not global_registry.is_file():
+        return False
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    expected = {
+        item["path"]: item["manifest_file_sha256"] for item in records
+    }
+    actual = {
+        item["path"]: item["manifest_file_sha256"]
+        for item in audit.get("manifests", [])
+    }
+    return (
+        audit.get("status") == "complete"
+        and audit.get("cross_lane_conflicts") == []
+        and actual == expected
+        and audit.get("global_registry", {}).get("sha256")
+        == sha256_file(global_registry)
+    )
+
+
+def _merge_parallel_overlap_registries(
+    config: LauncherConfig,
+    manifest_paths: list[Path],
+) -> dict[str, Any] | None:
+    records = _parallel_manifest_records(manifest_paths)
+    if not records:
+        return None
+    generated_root = Path(config.data.generated_root).resolve()
+    lane_root = generated_root / "preparation-lanes"
+    lane_root.mkdir(parents=True, exist_ok=True)
+    global_registry = generated_root / "overlap.sqlite3"
+    audit_path = generated_root / "parallel-preparation-audit.json"
+    if _parallel_audit_is_current(audit_path, records, global_registry):
+        return json.loads(audit_path.read_text(encoding="utf-8"))
+
+    languages = sorted({item["language"] for item in records})
+    lane_paths = {
+        language: _lane_registry_path(generated_root, language)
+        for language in languages
+    }
+    missing_lanes = [str(path) for path in lane_paths.values() if not path.is_file()]
+    if missing_lanes:
+        raise FileNotFoundError(
+            "Parallel preparation lane registries are missing: "
+            + ", ".join(missing_lanes)
+        )
+    for path in lane_paths.values():
+        _checkpoint_sqlite(path)
+    _checkpoint_sqlite(global_registry)
+
+    temporary = lane_root / f"global-merge-{os.getpid()}.sqlite3"
+    if temporary.exists():
+        raise FileExistsError(f"Refusing stale merge target: {temporary}")
+    conflict: dict[str, Any] | None = None
+    with OverlapRegistry(temporary) as merged:
+        connection = merged.connection
+        if global_registry.is_file():
+            connection.execute("ATTACH DATABASE ? AS baseline", (str(global_registry),))
+            connection.execute(
+                "INSERT INTO documents SELECT * FROM baseline.documents"
+            )
+            connection.commit()
+            connection.execute("DETACH DATABASE baseline")
+        for lane_index, (language, lane_path) in enumerate(lane_paths.items()):
+            alias = f"lane_{lane_index}"
+            connection.execute(
+                f"ATTACH DATABASE ? AS {alias}", (str(lane_path),)
+            )
+            content_row = connection.execute(
+                f"""
+                SELECT lane.content_sha256, lane.stage_id, main.stage_id
+                FROM {alias}.documents AS lane
+                JOIN documents AS main
+                  ON main.content_sha256=lane.content_sha256
+                WHERE {_rows_differ_clause('lane', 'main')}
+                LIMIT 1
+                """
+            ).fetchone()
+            token_row = connection.execute(
+                f"""
+                SELECT lane.token_ids_sha256, lane.stage_id, main.stage_id
+                FROM {alias}.documents AS lane
+                JOIN documents AS main
+                  ON main.token_ids_sha256=lane.token_ids_sha256
+                WHERE {_rows_differ_clause('lane', 'main')}
+                LIMIT 1
+                """
+            ).fetchone()
+            if content_row is not None or token_row is not None:
+                conflict = {
+                    "language": language,
+                    "content_conflict": content_row,
+                    "token_conflict": token_row,
+                }
+                connection.execute(f"DETACH DATABASE {alias}")
+                break
+            connection.execute(
+                f"INSERT OR IGNORE INTO documents SELECT * FROM {alias}.documents"
+            )
+            connection.commit()
+            connection.execute(f"DETACH DATABASE {alias}")
+        if conflict is not None:
+            raise ValueError(
+                "Cross-lane overlap prevents deterministic global merge: "
+                f"{conflict}"
+            )
+        for record in records:
+            count = merged.count_for_stage(record["stage_id"])
+            if count != record["accepted_document_count"]:
+                raise ValueError(
+                    "Merged registry count mismatch for stage "
+                    f"{record['stage_id']}: {count} != "
+                    f"{record['accepted_document_count']}"
+                )
+        merged.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        merged_count = merged.count()
+
+    backup = None
+    if global_registry.is_file():
+        old_sha = sha256_file(global_registry)
+        backup = lane_root / f"global-before-merge-{old_sha[:16]}.sqlite3"
+        if backup.exists():
+            if sha256_file(backup) != old_sha:
+                raise ValueError(f"Existing global-registry backup differs: {backup}")
+        else:
+            shutil.copy2(global_registry, backup)
+    os.replace(temporary, global_registry)
+    directory_fd = os.open(generated_root, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+    audit = {
+        "schema_version": 1,
+        "status": "complete",
+        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "method": "parallel_language_lanes_then_checked_global_merge_v1",
+        "cross_lane_conflicts": [],
+        "manifests": sorted(records, key=lambda item: item["path"]),
+        "lane_registries": [
+            {
+                "language": language,
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+            for language, path in lane_paths.items()
+        ],
+        "global_registry": {
+            "path": str(global_registry),
+            "size_bytes": global_registry.stat().st_size,
+            "sha256": sha256_file(global_registry),
+            "document_count": merged_count,
+            "pre_merge_backup": None if backup is None else str(backup),
+        },
+    }
+    atomic_write_json(audit_path, audit)
+    return audit
 
 
 def _tokenizer_reference(
@@ -150,6 +393,7 @@ def _manifest_identity(
     ):
         raise ValueError(f"Tokenizer identity mismatch: {manifest_path}")
     stage = manifest["stage"]
+    overlap_registry = manifest.get("overlap_registry", {})
     expected = {
         "language": expected_language,
         "cycle_index": expected_cycle,
@@ -193,6 +437,9 @@ def _manifest_identity(
         "language": stage["language"],
         "cycle_index": stage["cycle_index"],
         "task_index": stage["task_index"],
+        "preparation_lane_namespace": overlap_registry.get(
+            "preparation_lane_namespace"
+        ),
         "packed_token_count": int(manifest["token_count"]),
         "packed_target_token_count": int(manifest["target_token_count"]),
         "packed_complete_sequence_count": complete_sequences,
@@ -330,6 +577,30 @@ def resolve_data_contract(
         raise ValueError(
             "Vietnamese validation manifest has too few complete sequences"
         )
+    identities = [
+        identity
+        for cycle_items in matrix
+        for identity in cycle_items.values()
+    ] + [probe_training, probe_validation]
+    lane_paths = [
+        Path(identity["manifest_path"])
+        for identity in identities
+        if identity.get("preparation_lane_namespace") is not None
+    ]
+    parallel_audit = None
+    if lane_paths:
+        records = _parallel_manifest_records(lane_paths)
+        generated_root = Path(config.data.generated_root).resolve()
+        global_registry = generated_root / "overlap.sqlite3"
+        audit_path = generated_root / "parallel-preparation-audit.json"
+        if not _parallel_audit_is_current(
+            audit_path, records, global_registry
+        ):
+            raise ValueError(
+                "Parallel language-lane manifests require a current, "
+                "conflict-free global overlap merge audit"
+            )
+        parallel_audit = json.loads(audit_path.read_text(encoding="utf-8"))
     return {
         "mode": "packed",
         "cycle_manifest_policy": CYCLE_MANIFEST_POLICY,
@@ -338,6 +609,7 @@ def resolve_data_contract(
         "data_manifests": matrix,
         "probe_training_manifest": probe_training,
         "probe_validation_manifest": probe_validation,
+        "parallel_preparation_audit": parallel_audit,
         "tokenizer": {
             **asdict(tokenizer_ref),
             "manifest_file_sha256": tokenizer_file_sha,
@@ -571,7 +843,10 @@ def prepare_or_validate_data(
     *,
     execute_missing: bool | None = None,
     full_checksum_validation: bool = True,
+    parallel_languages: int = 1,
 ) -> dict[str, Any]:
+    if parallel_languages <= 0 or parallel_languages > len(LANGUAGE_CONFIGS):
+        raise ValueError("parallel_languages must be in [1, 9]")
     if config.data.mode == "synthetic":
         return resolve_data_contract(
             config, full_checksum_validation=full_checksum_validation
@@ -587,6 +862,7 @@ def prepare_or_validate_data(
         policy=config.experiment.token_budget_policy,
     )
     missing: list[tuple[DataPipelineConfig, Path, Path]] = []
+    expected_manifest_paths: list[Path] = []
     config_root = (
         Path(config.data.generated_root)
         / "preparation-configs"
@@ -602,6 +878,7 @@ def prepare_or_validate_data(
                 task_index=task_index,
                 budget=budget,
             )
+            expected_manifest_paths.append(manifest_path)
             if not manifest_path.is_file():
                 config_path = config_root / f"cycle-{cycle:04d}-{language}.yaml"
                 missing.append((pipeline, manifest_path, config_path))
@@ -632,6 +909,7 @@ def prepare_or_validate_data(
         ),
     )
     for manifest_path, stage_budget, purpose, seed_index, filename in probe_specs:
+        expected_manifest_paths.append(manifest_path)
         if manifest_path.is_file():
             continue
         pipeline, _ = materialization_config(
@@ -652,24 +930,79 @@ def prepare_or_validate_data(
         )
     for pipeline, _, config_path in missing:
         save_data_pipeline_config(pipeline, config_path)
+    grouped: dict[str, list[tuple[DataPipelineConfig, Path, Path]]] = {}
+    for item in missing:
+        grouped.setdefault(item[0].stage.language, []).append(item)
+
+    def run_lane(
+        language: str,
+        items: list[tuple[DataPipelineConfig, Path, Path]],
+    ) -> int:
         environment = dict(os.environ)
         environment.setdefault("HF_HOME", config.data.dataset_cache_root)
-        environment.setdefault("TOKENIZERS_PARALLELISM", "true")
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "lm_cl.cli.materialize_stage",
-                str(config_path),
-                "--execute",
-            ],
-            env=environment,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"Materialization failed with status {completed.returncode}: {config_path}"
+        environment["TOKENIZERS_PARALLELISM"] = "true"
+        if parallel_languages > 1:
+            environment["LM_CL_OVERLAP_REGISTRY_NAMESPACE"] = (
+                _lane_namespace(language)
             )
+            environment["RAYON_NUM_THREADS"] = str(
+                max(1, (os.cpu_count() or 1) // parallel_languages)
+            )
+            environment["LM_CL_TOKENIZER_BATCH_DOCUMENTS"] = "2048"
+            environment["LM_CL_STREAM_RESHARD_ROW_GROUPS"] = "false"
+            environment["LM_CL_STREAM_PREFETCH_SHARDS"] = "4"
+            environment["LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD"] = "256"
+            environment[
+                "LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES"
+            ] = "100000"
+        completed_count = 0
+        for _, _, config_path in items:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "lm_cl.cli.materialize_stage",
+                    str(config_path),
+                    "--execute",
+                ],
+                env=environment,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "Materialization failed with status "
+                    f"{completed.returncode}: {config_path}"
+                )
+            completed_count += 1
+        return completed_count
+
+    if parallel_languages == 1:
+        for language, items in grouped.items():
+            run_lane(language, items)
+    elif grouped:
+        with ThreadPoolExecutor(
+            max_workers=min(parallel_languages, len(grouped)),
+            thread_name_prefix="language-lane",
+        ) as executor:
+            futures = {
+                executor.submit(run_lane, language, items): language
+                for language, items in grouped.items()
+            }
+            for future in as_completed(futures):
+                language = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    for pending in futures:
+                        pending.cancel()
+                    raise RuntimeError(
+                        f"Parallel materialization lane failed: {language}"
+                    ) from exc
+    parallel_audit = None
+    if parallel_languages > 1:
+        parallel_audit = _merge_parallel_overlap_registries(
+            config, expected_manifest_paths
+        )
     result = resolve_data_contract(
         config, full_checksum_validation=full_checksum_validation
     )
@@ -678,4 +1011,6 @@ def prepare_or_validate_data(
         config.experiment.cycles * len(PUBLIC_LANGUAGE_ORDER)
     )
     result["preparation_config_root"] = str(config_root)
+    result["parallel_languages"] = parallel_languages
+    result["parallel_preparation_audit"] = parallel_audit
     return result

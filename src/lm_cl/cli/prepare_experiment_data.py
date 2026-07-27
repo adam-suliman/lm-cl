@@ -18,6 +18,15 @@ def command() -> None:
     parser.add_argument("--cycles", type=int, default=None)
     parser.add_argument("--tokens-per-task", type=int, default=None)
     parser.add_argument(
+        "--parallel-languages",
+        type=int,
+        default=1,
+        help=(
+            "materialize independent language lanes concurrently, then "
+            "require a checked global overlap-registry merge"
+        ),
+    )
+    parser.add_argument(
         "--manifest-only",
         action="store_true",
         help="validate identities without rereading every packed shard",
@@ -31,6 +40,7 @@ def command() -> None:
     result = prepare_or_validate_data(
         config,
         full_checksum_validation=not args.manifest_only,
+        parallel_languages=args.parallel_languages,
     )
     print_json(
         {

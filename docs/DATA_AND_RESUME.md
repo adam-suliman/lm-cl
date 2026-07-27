@@ -17,10 +17,16 @@ five cycles need roughly 820 GB. The preset therefore caps owned generated
 data at 1 TiB. Provision that capacity plus checkpoint/output and filesystem
 reserve before preparing a five-cycle horizon.
 
-The preparation CLI runs one isolated materialization subprocess per missing
-stage. It uses a global overlap registry and distinct deterministic order seeds
-to enforce fresh appearances. Existing stages are checksum-validated and are
-never fetched again. Once all stages exist, the launcher operates offline.
+The preparation CLI normally runs one isolated materialization subprocess per
+missing stage. With `--parallel-languages N`, it instead runs up to `N`
+independent language lanes. Cycles remain sequential inside each lane, so later
+appearances reject earlier documents exactly as before. Each lane has an
+independent overlap registry and lock. After every stage completes, preparation
+merges the lanes into the global registry, verifies exact per-stage row counts,
+and fails on any non-identical content-hash or token-hash collision. A
+hash-bound `parallel-preparation-audit.json` is mandatory before lane-produced
+manifests can enter a resolved experiment. Existing stages are never fetched
+again, and the launcher remains offline after validation.
 
 Materialization engine v2 keeps that stage order but removes hot-loop storage
 serialization. It tokenizes an ordered document batch through the fast
@@ -46,10 +52,10 @@ export RAYON_NUM_THREADS="$(nproc)"
 export LM_CL_TOKENIZER_BATCH_DOCUMENTS=2048
 export LM_CL_REGISTRY_CACHE_MIB=4096
 export LM_CL_REGISTRY_MMAP_MIB=65536
-export LM_CL_STREAM_RESHARD_ROW_GROUPS=true
+export LM_CL_STREAM_RESHARD_ROW_GROUPS=false
 export LM_CL_STREAM_RESHARD_FILE_PREFIX=32
-export LM_CL_STREAM_PREFETCH_SHARDS=16
-export LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD=250000
+export LM_CL_STREAM_PREFETCH_SHARDS=4
+export LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD=256
 export LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES=100000
 ```
 
@@ -81,11 +87,13 @@ concatenating the expanded shards reconstructs the original row order. A large
 per-shard row queue lets later row groups finish remote reads while the current
 group is consumed. `250000` rows across 16 workers can retain tens of GiB of raw
 text and Python objects, so that setting is intended only for the documented
-1.5 TiB preparation host. The first 32 original parquet files are sufficient
-for the configured 20,000,000-document ceiling and avoid opening metadata for
+1.5 TiB preparation host. The first 32 original parquet files are intended to
+cover the configured 30,000,000-document ceiling and avoid opening metadata for
 the entire multi-terabyte language configuration; failure to reach the exact
-token target still fails the stage. Defaults remain row-group resharding off
-and 64 queued rows per shard.
+token target still fails the stage. The CulturaX remote backend did not scale
+under concurrent row-group range reads on the documented host, so parallel
+language preparation explicitly disables this option. Defaults remain
+row-group resharding off and 64 queued rows per shard.
 
 `LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES` optionally increases the number
 of selected candidates between durable materialization checkpoints. The
@@ -108,7 +116,9 @@ same exact-identity requirement. Incomplete stages from commit `85adf1a` can
 migrate to contiguous parquet row-group prefetch. An increasing
 `max_input_documents` execution ceiling is accepted during these migrations
 only when every other frozen configuration value matches; the old and new caps
-are recorded in the migration evidence.
+are recorded in the migration evidence. Incomplete stages from commit `9f3a94a`
+can migrate into a named language-lane registry; their checkpointed boundaries
+are replayed into that lane before new documents are accepted.
 
 Use `--manifest-only` or `--manifest-only-preflight` only after a full shard
 checksum validation has been recorded for those immutable files. These modes
