@@ -271,6 +271,10 @@ def test_progress_reports_checkpoint_throughput(tmp_path, monkeypatch):
             "5f50e9d27d94968e959c7de71754ebe653a12b4413ec14bd594d61e58bf92223",
             "bounded_contiguous_shard_prefetch_performance_upgrade",
         ),
+        (
+            "3f4083e2c8d41fa449cea97290963eb319aba807bb8052ef06a2ea551456bdf6",
+            "amortized_materialization_checkpoint_performance_upgrade",
+        ),
     ],
 )
 def test_legacy_incomplete_stage_migrates_and_resumes_exactly(
@@ -347,6 +351,38 @@ def test_periodic_disk_guard_amortizes_recursive_checks(monkeypatch, tmp_path):
     assert guard.check() == 7
     assert guard.check() == 7
     assert len(calls) == 2
+
+
+def test_checkpoint_candidate_override_preserves_output_identity(
+    tmp_path, monkeypatch
+):
+    frequent_config = _config(
+        tmp_path,
+        generated_name="frequent-checkpoint",
+        checkpoint_every=2,
+    )
+    monkeypatch.delenv(
+        "LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES", raising=False
+    )
+    frequent = _run(frequent_config, BatchTokenizer())
+
+    amortized_config = _config(
+        tmp_path,
+        generated_name="amortized-checkpoint",
+        checkpoint_every=2,
+    )
+    monkeypatch.setenv(
+        "LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES", "100"
+    )
+    amortized = _run(amortized_config, BatchTokenizer())
+
+    assert _packed_bytes(frequent_config, frequent) == _packed_bytes(
+        amortized_config, amortized
+    )
+    assert frequent["ordered_data_sha256"] == amortized["ordered_data_sha256"]
+    assert frequent["accepted_document_count"] == amortized[
+        "accepted_document_count"
+    ]
 
 
 def test_parallel_shard_prefetch_preserves_exact_concatenated_order(

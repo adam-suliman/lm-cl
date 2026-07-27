@@ -48,17 +48,27 @@ class SimulatedInterruption(RuntimeError):
 
 
 MATERIALIZATION_ENGINE_VERSION = 2
+LEGACY_ORDERED_MATERIALIZATION_MIGRATIONS = {
+    # Public release commit 56c2f08. Engine v2 changes only execution: ordered
+    # batches, transaction cadence, and cap-check cadence. The selection,
+    # tokenization, overlap, packing, and hash contracts remain unchanged.
+    "888f3af9474c74aab93ccdfa39c0a25b0ab223d1def241b70707aca7ea5fc30d": (
+        "ordered_materialization_engine_v2"
+    ),
+    # Commit a318fe3 introduced engine v2 before bounded concurrent shard
+    # prefetch. Prefetch preserves the documented contiguous shard order.
+    "5f50e9d27d94968e959c7de71754ebe653a12b4413ec14bd594d61e58bf92223": (
+        "bounded_contiguous_shard_prefetch"
+    ),
+    # Commit 82009c6 adds exact-order shard prefetch. Increasing only the
+    # durable checkpoint interval changes crash replay cost, never accepted
+    # documents, packing, hashes, or the final manifest identity.
+    "3f4083e2c8d41fa449cea97290963eb319aba807bb8052ef06a2ea551456bdf6": (
+        "amortized_materialization_checkpoint"
+    ),
+}
 LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S = frozenset(
-    {
-        # Public release commit 56c2f08.  Engine v2 changes only execution:
-        # ordered batches, transaction cadence, and cap-check cadence.  The
-        # selection, tokenization, overlap, packing, and hash contracts remain
-        # unchanged, so its incomplete stages can be migrated explicitly.
-        "888f3af9474c74aab93ccdfa39c0a25b0ab223d1def241b70707aca7ea5fc30d",
-        # Commit a318fe3 introduced engine v2 before bounded concurrent shard
-        # prefetch. Prefetch preserves the documented contiguous shard order.
-        "5f50e9d27d94968e959c7de71754ebe653a12b4413ec14bd594d61e58bf92223",
-    }
+    LEGACY_ORDERED_MATERIALIZATION_MIGRATIONS
 )
 
 
@@ -77,9 +87,26 @@ def materialization_performance_settings() -> dict[str, Any]:
             raise ValueError(
                 "LM_CL_TOKENIZER_BATCH_DOCUMENTS must be in [1, 16384]"
             )
+    checkpoint_raw = os.environ.get(
+        "LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES"
+    )
+    checkpoint_candidates = None
+    if checkpoint_raw is not None:
+        try:
+            checkpoint_candidates = int(checkpoint_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES must be an integer"
+            ) from exc
+        if checkpoint_candidates <= 0 or checkpoint_candidates > 1_000_000:
+            raise ValueError(
+                "LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES must be in "
+                "[1, 1000000]"
+            )
     settings = {
         "engine_version": MATERIALIZATION_ENGINE_VERSION,
         "tokenizer_batch_documents": batch_size,
+        "checkpoint_candidates_override": checkpoint_candidates,
         "tokenizers_parallelism": os.environ.get(
             "TOKENIZERS_PARALLELISM", "unset"
         ),
@@ -203,12 +230,9 @@ def _load_compatible_incomplete_manifest(
         raise ValueError("Resume configuration/tokenizer fingerprint mismatch")
 
     migrated_at = datetime.now(timezone.utc).isoformat()
-    migration_kind = (
-        "ordered_materialization_engine_v2"
-        if previous_source
-        == "888f3af9474c74aab93ccdfa39c0a25b0ab223d1def241b70707aca7ea5fc30d"
-        else "bounded_contiguous_shard_prefetch"
-    )
+    migration_kind = LEGACY_ORDERED_MATERIALIZATION_MIGRATIONS[
+        previous_source
+    ]
     migration_reason = f"{migration_kind}_performance_upgrade"
     history = state.setdefault("software_history", [])
     if not isinstance(history, list):
@@ -773,10 +797,17 @@ def _materialize_stage(
                         counters=counters,
                     )
                 )
+                performance_settings = materialization_performance_settings()
                 batch_size = int(
-                    materialization_performance_settings()[
-                        "tokenizer_batch_documents"
-                    ]
+                    performance_settings["tokenizer_batch_documents"]
+                )
+                checkpoint_override = performance_settings[
+                    "checkpoint_candidates_override"
+                ]
+                checkpoint_candidates = int(
+                    checkpoint_override
+                    if checkpoint_override is not None
+                    else config.stage.checkpoint_every_candidates
                 )
                 last_checkpoint_selected = int(state["selected_document_count"])
                 invocation_started = time.monotonic()
@@ -803,7 +834,7 @@ def _materialize_stage(
                     )
                     if (
                         not force
-                        and processed < config.stage.checkpoint_every_candidates
+                        and processed < checkpoint_candidates
                     ):
                         return
                     flush_pending_tokens()

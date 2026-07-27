@@ -76,6 +76,7 @@ export LM_CL_REGISTRY_CACHE_MIB=4096
 export LM_CL_REGISTRY_MMAP_MIB=65536
 export LM_CL_STREAM_PREFETCH_SHARDS=16
 export LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD=256
+export LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES=100000
 ```
 
 Batching changes only execution. Documents are still accepted and registered
@@ -83,7 +84,9 @@ in the exact deterministic order, and tests require scalar and batched runs to
 produce identical packed bytes and `ordered_data_sha256`. The CLI emits a JSON
 progress event at every resumable stage checkpoint, including invocation token
 throughput. CulturaX data-source shards are prefetched concurrently but consumed
-in their original contiguous order.
+in their original contiguous order. The optional checkpoint override amortizes
+durable filesystem synchronization; it changes only how much deterministic work
+must be replayed after interruption, not final data or manifest identity.
 
 Preparation uses pinned `uonlp/CulturaX` revision
 `6a8734bc69fefcbb7735f4f9250f43e4cd7a442e`, the approved language mapping,
