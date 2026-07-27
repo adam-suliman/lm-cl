@@ -40,9 +40,27 @@ def _performance_integer(name: str, default: int, maximum: int) -> int:
     return value
 
 
-def streaming_performance_settings() -> dict[str, int]:
+def _performance_boolean(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def streaming_performance_settings() -> dict[str, int | bool]:
     cpu_count = os.cpu_count() or 1
     return {
+        "stream_reshard_row_groups": _performance_boolean(
+            "LM_CL_STREAM_RESHARD_ROW_GROUPS", False
+        ),
+        "stream_reshard_file_prefix": _performance_integer(
+            "LM_CL_STREAM_RESHARD_FILE_PREFIX", 32, 1024
+        ),
         "stream_prefetch_shards": _performance_integer(
             "LM_CL_STREAM_PREFETCH_SHARDS",
             min(8, max(1, cpu_count // 8)),
@@ -51,7 +69,7 @@ def streaming_performance_settings() -> dict[str, int]:
         "stream_prefetch_rows_per_shard": _performance_integer(
             "LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD",
             64,
-            4096,
+            1_000_000,
         ),
     }
 
@@ -182,6 +200,41 @@ def stream_culturax_rows(config: DataPipelineConfig) -> Iterable[dict[str, Any]]
                     revision=config.dataset.revision,
                     cache_dir=str(cache_root),
                 )
+                if streaming_performance_settings()[
+                    "stream_reshard_row_groups"
+                ]:
+                    settings = streaming_performance_settings()
+                    source_shards = int(getattr(stream, "num_shards", 1))
+                    file_prefix = min(
+                        int(settings["stream_reshard_file_prefix"]),
+                        source_shards,
+                    )
+                    if file_prefix < source_shards:
+                        concatenate = getattr(
+                            datasets, "concatenate_datasets", None
+                        )
+                        if not callable(concatenate):
+                            raise RuntimeError(
+                                "Installed datasets cannot concatenate an "
+                                "ordered CulturaX file prefix"
+                            )
+                        stream = concatenate(
+                            [
+                                stream.shard(
+                                    num_shards=source_shards,
+                                    index=index,
+                                    contiguous=True,
+                                )
+                                for index in range(file_prefix)
+                            ]
+                        )
+                    reshard = getattr(stream, "reshard", None)
+                    if not callable(reshard):
+                        raise RuntimeError(
+                            "Installed datasets does not support deterministic "
+                            "parquet row-group resharding"
+                        )
+                    stream = reshard()
             except Exception as exc:
                 raise RuntimeError(
                     "Unable to open pinned CulturaX stream. Check dataset access, "

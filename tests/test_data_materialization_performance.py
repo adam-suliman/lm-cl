@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -275,6 +276,10 @@ def test_progress_reports_checkpoint_throughput(tmp_path, monkeypatch):
             "3f4083e2c8d41fa449cea97290963eb319aba807bb8052ef06a2ea551456bdf6",
             "amortized_materialization_checkpoint_performance_upgrade",
         ),
+        (
+            "afea355788a2782192511539c354853076414766af6f1bd0970f051c2a0dc3de",
+            "contiguous_parquet_row_group_prefetch_performance_upgrade",
+        ),
     ],
 )
 def test_legacy_incomplete_stage_migrates_and_resumes_exactly(
@@ -385,6 +390,50 @@ def test_checkpoint_candidate_override_preserves_output_identity(
     ]
 
 
+def test_resume_allows_only_an_increasing_input_document_cap(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LM_CL_TOKENIZER_BATCH_DOCUMENTS", "16")
+    original = _config(
+        tmp_path,
+        generated_name="cap-extension",
+        token_cap=768,
+        checkpoint_every=4,
+    )
+    with pytest.raises(SimulatedInterruption):
+        _run(original, BatchTokenizer(), _interrupt_after_documents=4)
+
+    incomplete = (
+        Path(original.storage.generated_root)
+        / "stages/ordered-stage/manifest.incomplete.json"
+    )
+    state = json.loads(incomplete.read_text(encoding="utf-8"))
+    previous_software = dict(state["software"])
+    previous_source = (
+        "afea355788a2782192511539c354853076414766af6f1bd0970f051c2a0dc3de"
+    )
+    previous_software["source_tree_sha256"] = previous_source
+    state["software"] = previous_software
+    state["config_fingerprint"] = _config_fingerprint(
+        original,
+        _manifest(),
+        source_tree_sha256=previous_source,
+        python_version=previous_software["python"],
+        package_versions=previous_software["package_versions"],
+    )
+    incomplete.write_text(json.dumps(state), encoding="utf-8")
+
+    extended = replace(
+        original,
+        selection=replace(original.selection, max_input_documents=256),
+    )
+    resumed = _run(extended, BatchTokenizer())
+    assert resumed["selection"]["max_input_documents"] == 256
+    assert resumed["resume_migrations"][-1][
+        "selection_max_input_documents_extension"
+    ] == {"from": 128, "to": 256}
+
+
 def test_parallel_shard_prefetch_preserves_exact_concatenated_order(
     tmp_path, monkeypatch
 ):
@@ -477,3 +526,43 @@ def test_parallel_shard_prefetch_propagates_worker_failure(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match="broken shard"):
         list(huggingface_data.stream_culturax_rows(config))
     assert set(closed) == {0, 1, "stream"}
+
+
+def test_real_parquet_row_group_resharding_preserves_exact_order(
+    tmp_path, monkeypatch
+):
+    datasets = pytest.importorskip("datasets")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    rows = [
+        {"url": f"row-{index}", "text": f"text-{index}"}
+        for index in range(12)
+    ]
+    parquet_paths = []
+    for file_index in range(2):
+        path = tmp_path / f"part-{file_index}.parquet"
+        file_rows = rows[file_index * 6 : (file_index + 1) * 6]
+        pq.write_table(
+            pa.Table.from_pylist(file_rows),
+            path,
+            row_group_size=2,
+        )
+        parquet_paths.append(str(path))
+    stream = datasets.load_dataset(
+        "parquet",
+        data_files={"train": parquet_paths},
+        split="train",
+        streaming=True,
+    )
+    assert stream.num_shards == 2
+    monkeypatch.setenv("LM_CL_STREAM_RESHARD_ROW_GROUPS", "true")
+    monkeypatch.setenv("LM_CL_STREAM_PREFETCH_SHARDS", "4")
+    monkeypatch.setenv("LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD", "100")
+    monkeypatch.setattr(
+        huggingface_data,
+        "_datasets_module",
+        lambda: types.SimpleNamespace(load_dataset=lambda *args, **kwargs: stream),
+    )
+    config = _config(tmp_path, generated_name="row-group-stream")
+    actual = list(huggingface_data.stream_culturax_rows(config))
+    assert actual == rows

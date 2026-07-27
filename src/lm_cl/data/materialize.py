@@ -6,6 +6,7 @@ import os
 import platform
 import time
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from itertools import islice
@@ -65,6 +66,12 @@ LEGACY_ORDERED_MATERIALIZATION_MIGRATIONS = {
     # documents, packing, hashes, or the final manifest identity.
     "3f4083e2c8d41fa449cea97290963eb319aba807bb8052ef06a2ea551456bdf6": (
         "amortized_materialization_checkpoint"
+    ),
+    # Commit 85adf1a supports the amortized checkpoint override. Deterministic
+    # parquet row-group resharding preserves the source row order while making
+    # remote reads concurrent.
+    "afea355788a2782192511539c354853076414766af6f1bd0970f051c2a0dc3de": (
+        "contiguous_parquet_row_group_prefetch"
     ),
 }
 LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S = frozenset(
@@ -219,8 +226,30 @@ def _load_compatible_incomplete_manifest(
         or not isinstance(previous_packages, dict)
     ):
         raise ValueError("Resume configuration/tokenizer fingerprint mismatch")
+    fingerprint_config = config
+    cap_extension = None
+    previous_selection = state.get("selection")
+    if isinstance(previous_selection, dict):
+        previous_cap = previous_selection.get("max_input_documents")
+        if (
+            isinstance(previous_cap, int)
+            and previous_cap > 0
+            and config.selection.max_input_documents > previous_cap
+            and int(state.get("input_document_count", 0)) <= previous_cap
+        ):
+            fingerprint_config = replace(
+                config,
+                selection=replace(
+                    config.selection,
+                    max_input_documents=previous_cap,
+                ),
+            )
+            cap_extension = {
+                "from": previous_cap,
+                "to": config.selection.max_input_documents,
+            }
     legacy_fingerprint = _config_fingerprint(
-        config,
+        fingerprint_config,
         tokenizer_manifest,
         source_tree_sha256=previous_source,
         python_version=previous_python,
@@ -247,6 +276,8 @@ def _load_compatible_incomplete_manifest(
     )
     state["software"] = _software_record()
     state["config_fingerprint"] = current_fingerprint
+    if cap_extension is not None:
+        state["selection"]["max_input_documents"] = cap_extension["to"]
     state["resume_protocol_version"] = 2
     migrations = state.setdefault("resume_migrations", [])
     if not isinstance(migrations, list):
@@ -259,6 +290,7 @@ def _load_compatible_incomplete_manifest(
             "to_source_tree_sha256": state["software"]["source_tree_sha256"],
             "scientific_ordering_changed": False,
             "packed_token_semantics_changed": False,
+            "selection_max_input_documents_extension": cap_extension,
         }
     )
     state["updated_at_utc"] = migrated_at

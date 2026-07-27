@@ -46,8 +46,10 @@ export RAYON_NUM_THREADS="$(nproc)"
 export LM_CL_TOKENIZER_BATCH_DOCUMENTS=2048
 export LM_CL_REGISTRY_CACHE_MIB=4096
 export LM_CL_REGISTRY_MMAP_MIB=65536
+export LM_CL_STREAM_RESHARD_ROW_GROUPS=true
+export LM_CL_STREAM_RESHARD_FILE_PREFIX=32
 export LM_CL_STREAM_PREFETCH_SHARDS=16
-export LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD=256
+export LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD=250000
 export LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES=100000
 ```
 
@@ -72,6 +74,19 @@ shards and 64 queued rows per shard. The larger values above are intended for
 this high-bandwidth, high-memory machine. A stream without the required shard
 API uses the original serial iterator.
 
+With `LM_CL_STREAM_RESHARD_ROW_GROUPS=true`, supported parquet streams are
+deterministically expanded from file shards to their contiguous row groups
+before prefetch. This uses the installed `datasets` public `reshard()` contract:
+concatenating the expanded shards reconstructs the original row order. A large
+per-shard row queue lets later row groups finish remote reads while the current
+group is consumed. `250000` rows across 16 workers can retain tens of GiB of raw
+text and Python objects, so that setting is intended only for the documented
+1.5 TiB preparation host. The first 32 original parquet files are sufficient
+for the configured 20,000,000-document ceiling and avoid opening metadata for
+the entire multi-terabyte language configuration; failure to reach the exact
+token target still fails the stage. Defaults remain row-group resharding off
+and 64 queued rows per shard.
+
 `LM_CL_MATERIALIZATION_CHECKPOINT_CANDIDATES` optionally increases the number
 of selected candidates between durable materialization checkpoints. The
 configured stage value remains the default. A larger override amortizes costly
@@ -89,7 +104,11 @@ that ordering and packing semantics were unchanged. Complete manifests are
 never rewritten. Incomplete engine-v2 stages from commit `a318fe3` are likewise
 eligible for the bounded contiguous-shard-prefetch migration. Incomplete stages
 from commit `82009c6` can migrate to the amortized-checkpoint engine under the
-same exact-identity requirement.
+same exact-identity requirement. Incomplete stages from commit `85adf1a` can
+migrate to contiguous parquet row-group prefetch. An increasing
+`max_input_documents` execution ceiling is accepted during these migrations
+only when every other frozen configuration value matches; the old and new caps
+are recorded in the migration evidence.
 
 Use `--manifest-only` or `--manifest-only-preflight` only after a full shard
 checksum validation has been recorded for those immutable files. These modes
