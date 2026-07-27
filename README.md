@@ -74,13 +74,16 @@ export RAYON_NUM_THREADS=128
 export LM_CL_TOKENIZER_BATCH_DOCUMENTS=2048
 export LM_CL_REGISTRY_CACHE_MIB=4096
 export LM_CL_REGISTRY_MMAP_MIB=65536
+export LM_CL_STREAM_PREFETCH_SHARDS=16
+export LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD=256
 ```
 
 Batching changes only execution. Documents are still accepted and registered
 in the exact deterministic order, and tests require scalar and batched runs to
 produce identical packed bytes and `ordered_data_sha256`. The CLI emits a JSON
 progress event at every resumable stage checkpoint, including invocation token
-throughput.
+throughput. CulturaX data-source shards are prefetched concurrently but consumed
+in their original contiguous order.
 
 Preparation uses pinned `uonlp/CulturaX` revision
 `6a8734bc69fefcbb7735f4f9250f43e4cd7a442e`, the approved language mapping,

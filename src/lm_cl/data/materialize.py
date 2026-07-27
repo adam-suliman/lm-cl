@@ -15,6 +15,7 @@ from typing import Any, Callable
 import numpy as np
 
 from lm_cl.config.data_schema import DataPipelineConfig
+from lm_cl.data.huggingface import streaming_performance_settings
 from lm_cl.data.iteration import close_iterable
 from lm_cl.data.packed import (
     PackedShardWriter,
@@ -54,6 +55,9 @@ LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S = frozenset(
         # selection, tokenization, overlap, packing, and hash contracts remain
         # unchanged, so its incomplete stages can be migrated explicitly.
         "888f3af9474c74aab93ccdfa39c0a25b0ab223d1def241b70707aca7ea5fc30d",
+        # Commit a318fe3 introduced engine v2 before bounded concurrent shard
+        # prefetch. Prefetch preserves the documented contiguous shard order.
+        "5f50e9d27d94968e959c7de71754ebe653a12b4413ec14bd594d61e58bf92223",
     }
 )
 
@@ -73,7 +77,7 @@ def materialization_performance_settings() -> dict[str, Any]:
             raise ValueError(
                 "LM_CL_TOKENIZER_BATCH_DOCUMENTS must be in [1, 16384]"
             )
-    return {
+    settings = {
         "engine_version": MATERIALIZATION_ENGINE_VERSION,
         "tokenizer_batch_documents": batch_size,
         "tokenizers_parallelism": os.environ.get(
@@ -90,6 +94,8 @@ def materialization_performance_settings() -> dict[str, Any]:
         "generated_cap_policy": "preflight_bound_and_final_check_v1",
         "cache_cap_check_interval_seconds": 5,
     }
+    settings.update(streaming_performance_settings())
+    return settings
 
 
 def _source_tree_sha256() -> str:
@@ -197,12 +203,19 @@ def _load_compatible_incomplete_manifest(
         raise ValueError("Resume configuration/tokenizer fingerprint mismatch")
 
     migrated_at = datetime.now(timezone.utc).isoformat()
+    migration_kind = (
+        "ordered_materialization_engine_v2"
+        if previous_source
+        == "888f3af9474c74aab93ccdfa39c0a25b0ab223d1def241b70707aca7ea5fc30d"
+        else "bounded_contiguous_shard_prefetch"
+    )
+    migration_reason = f"{migration_kind}_performance_upgrade"
     history = state.setdefault("software_history", [])
     if not isinstance(history, list):
         raise ValueError("Resume software history is invalid")
     history.append(
         {
-            "reason": "ordered_materialization_engine_v2_performance_upgrade",
+            "reason": migration_reason,
             "replaced_at_utc": migrated_at,
             "config_fingerprint": state["config_fingerprint"],
             "software": previous_software,
@@ -216,7 +229,7 @@ def _load_compatible_incomplete_manifest(
         raise ValueError("Resume migration history is invalid")
     migrations.append(
         {
-            "kind": "ordered_materialization_engine_v2",
+            "kind": migration_kind,
             "at_utc": migrated_at,
             "from_source_tree_sha256": previous_source,
             "to_source_tree_sha256": state["software"]["source_tree_sha256"],

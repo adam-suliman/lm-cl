@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+import threading
+import types
 from pathlib import Path
 
 import pytest
 
+import lm_cl.data.huggingface as huggingface_data
 from lm_cl.config import (
     DataPipelineConfig,
     DatasetReference,
@@ -258,8 +260,21 @@ def test_progress_reports_checkpoint_throughput(tmp_path, monkeypatch):
     assert all(event["event"] == "materialization_progress" for event in events)
 
 
+@pytest.mark.parametrize(
+    ("legacy_source", "expected_reason"),
+    [
+        (
+            "888f3af9474c74aab93ccdfa39c0a25b0ab223d1def241b70707aca7ea5fc30d",
+            "ordered_materialization_engine_v2_performance_upgrade",
+        ),
+        (
+            "5f50e9d27d94968e959c7de71754ebe653a12b4413ec14bd594d61e58bf92223",
+            "bounded_contiguous_shard_prefetch_performance_upgrade",
+        ),
+    ],
+)
 def test_legacy_incomplete_stage_migrates_and_resumes_exactly(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy_source, expected_reason
 ):
     monkeypatch.setenv("LM_CL_TOKENIZER_BATCH_DOCUMENTS", "16")
     config = _config(
@@ -276,7 +291,7 @@ def test_legacy_incomplete_stage_migrates_and_resumes_exactly(
         / "stages/ordered-stage/manifest.incomplete.json"
     )
     state = json.loads(incomplete.read_text(encoding="utf-8"))
-    legacy_source = next(iter(LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S))
+    assert legacy_source in LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S
     previous_software = dict(state["software"])
     previous_software.pop("materialization_performance", None)
     previous_software["source_tree_sha256"] = legacy_source
@@ -293,9 +308,7 @@ def test_legacy_incomplete_stage_migrates_and_resumes_exactly(
 
     resumed = _run(config, BatchTokenizer())
     assert resumed["resume_protocol_version"] == 2
-    assert resumed["software_history"][-1]["reason"] == (
-        "ordered_materialization_engine_v2_performance_upgrade"
-    )
+    assert resumed["software_history"][-1]["reason"] == expected_reason
     assert (
         resumed["resume_migrations"][-1]["scientific_ordering_changed"]
         is False
@@ -334,3 +347,97 @@ def test_periodic_disk_guard_amortizes_recursive_checks(monkeypatch, tmp_path):
     assert guard.check() == 7
     assert guard.check() == 7
     assert len(calls) == 2
+
+
+def test_parallel_shard_prefetch_preserves_exact_concatenated_order(
+    tmp_path, monkeypatch
+):
+    barrier = threading.Barrier(3)
+    closed = []
+    shard_rows = [
+        [
+            {"url": "shard-0-row-0", "text": "zero-a"},
+            {"url": "shard-0-row-1", "text": "zero-b"},
+        ],
+        [{"url": "shard-1-row-0", "text": "one-a"}],
+        [
+            {"url": "shard-2-row-0", "text": "two-a"},
+            {"url": "shard-2-row-1", "text": "two-b"},
+        ],
+    ]
+
+    class Shard:
+        def __init__(self, index):
+            self.index = index
+
+        def __iter__(self):
+            barrier.wait(timeout=5)
+            yield from shard_rows[self.index]
+
+        def close(self):
+            closed.append(f"shard-{self.index}")
+
+    class Stream:
+        num_shards = 3
+
+        def shard(self, *, num_shards, index, contiguous):
+            assert num_shards == self.num_shards
+            assert contiguous is True
+            return Shard(index)
+
+        def close(self):
+            closed.append("stream")
+
+    monkeypatch.setenv("LM_CL_STREAM_PREFETCH_SHARDS", "3")
+    monkeypatch.setenv("LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD", "2")
+    monkeypatch.setattr(
+        huggingface_data,
+        "_datasets_module",
+        lambda: types.SimpleNamespace(load_dataset=lambda *args, **kwargs: Stream()),
+    )
+    config = _config(tmp_path, generated_name="parallel-stream")
+    rows = list(huggingface_data.stream_culturax_rows(config))
+    assert [row["url"] for row in rows] == [
+        "shard-0-row-0",
+        "shard-0-row-1",
+        "shard-1-row-0",
+        "shard-2-row-0",
+        "shard-2-row-1",
+    ]
+    assert set(closed) == {"shard-0", "shard-1", "shard-2", "stream"}
+
+
+def test_parallel_shard_prefetch_propagates_worker_failure(tmp_path, monkeypatch):
+    closed = []
+
+    class Shard:
+        def __init__(self, index):
+            self.index = index
+
+        def __iter__(self):
+            if self.index == 1:
+                raise ValueError("broken shard")
+            yield {"url": f"row-{self.index}", "text": "valid"}
+
+        def close(self):
+            closed.append(self.index)
+
+    class Stream:
+        num_shards = 2
+
+        def shard(self, *, num_shards, index, contiguous):
+            return Shard(index)
+
+        def close(self):
+            closed.append("stream")
+
+    monkeypatch.setenv("LM_CL_STREAM_PREFETCH_SHARDS", "2")
+    monkeypatch.setattr(
+        huggingface_data,
+        "_datasets_module",
+        lambda: types.SimpleNamespace(load_dataset=lambda *args, **kwargs: Stream()),
+    )
+    config = _config(tmp_path, generated_name="failed-stream")
+    with pytest.raises(RuntimeError, match="broken shard"):
+        list(huggingface_data.stream_culturax_rows(config))
+    assert set(closed) == {0, 1, "stream"}

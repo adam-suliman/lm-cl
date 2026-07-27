@@ -46,6 +46,8 @@ export RAYON_NUM_THREADS="$(nproc)"
 export LM_CL_TOKENIZER_BATCH_DOCUMENTS=2048
 export LM_CL_REGISTRY_CACHE_MIB=4096
 export LM_CL_REGISTRY_MMAP_MIB=65536
+export LM_CL_STREAM_PREFETCH_SHARDS=16
+export LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD=256
 ```
 
 Without an explicit batch size, the engine uses 16 documents per visible CPU,
@@ -59,12 +61,23 @@ The larger values above are appropriate only on a high-memory machine; they do
 not preallocate or persist additional project data and do not alter registry
 contents.
 
+When the installed `datasets` streaming object exposes multiple data-source
+shards, the engine opens a bounded number concurrently and fills a bounded
+per-shard row queue. Consumers still drain shard 0 completely before shard 1,
+and so on. Hugging Face specifies that concatenating these contiguous shards
+reconstructs the original dataset order; tests exercise both true concurrent
+startup and exact concatenated output. Defaults are at most eight concurrent
+shards and 64 queued rows per shard. The larger values above are intended for
+this high-bandwidth, high-memory machine. A stream without the required shard
+API uses the original serial iterator.
+
 An incomplete stage produced by public release commit `56c2f08` is eligible
 for one explicit engine-v2 resume migration. The old configuration fingerprint
 is recomputed and must match before migration; no arbitrary source mismatch is
 accepted. The final manifest preserves the prior software record and records
 that ordering and packing semantics were unchanged. Complete manifests are
-never rewritten.
+never rewritten. Incomplete engine-v2 stages from commit `a318fe3` are likewise
+eligible for the bounded contiguous-shard-prefetch migration.
 
 Use `--manifest-only` or `--manifest-only-preflight` only after a full shard
 checksum validation has been recorded for those immutable files. These modes

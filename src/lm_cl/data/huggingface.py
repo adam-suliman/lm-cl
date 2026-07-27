@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Full, Queue
+from threading import Event
 from typing import Any, Iterable
 
 from lm_cl.config.data_schema import DataPipelineConfig
@@ -21,6 +25,110 @@ DATA_INSTALL_COMMAND = (
 
 class MissingDataDependencyError(RuntimeError):
     pass
+
+
+def _performance_integer(name: str, default: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value <= 0 or value > maximum:
+        raise ValueError(f"{name} must be in [1, {maximum}]")
+    return value
+
+
+def streaming_performance_settings() -> dict[str, int]:
+    cpu_count = os.cpu_count() or 1
+    return {
+        "stream_prefetch_shards": _performance_integer(
+            "LM_CL_STREAM_PREFETCH_SHARDS",
+            min(8, max(1, cpu_count // 8)),
+            64,
+        ),
+        "stream_prefetch_rows_per_shard": _performance_integer(
+            "LM_CL_STREAM_PREFETCH_ROWS_PER_SHARD",
+            64,
+            4096,
+        ),
+    }
+
+
+def _ordered_shard_rows(stream: Any) -> Iterable[dict[str, Any]]:
+    settings = streaming_performance_settings()
+    shard_count = int(getattr(stream, "num_shards", 1))
+    shard_method = getattr(stream, "shard", None)
+    if shard_count <= 1 or not callable(shard_method):
+        iterator = iter(stream)
+        try:
+            yield from iterator
+        finally:
+            if iterator is not stream:
+                close_iterable(iterator)
+        return
+
+    worker_count = min(settings["stream_prefetch_shards"], shard_count)
+    rows_per_shard = settings["stream_prefetch_rows_per_shard"]
+    stop = Event()
+    queues: list[Queue[tuple[str, Any]]] = [
+        Queue(maxsize=rows_per_shard) for _ in range(shard_count)
+    ]
+
+    def put(index: int, kind: str, value: Any) -> bool:
+        while not stop.is_set():
+            try:
+                queues[index].put((kind, value), timeout=0.1)
+                return True
+            except Full:
+                continue
+        return False
+
+    def produce(index: int) -> None:
+        owner = None
+        iterator = None
+        try:
+            owner = stream.shard(
+                num_shards=shard_count,
+                index=index,
+                contiguous=True,
+            )
+            iterator = iter(owner)
+            for row in iterator:
+                if not put(index, "row", row):
+                    return
+        except BaseException as exc:
+            put(index, "error", exc)
+        finally:
+            close_iterable(owner, iterator=iterator)
+            put(index, "done", None)
+
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="culturax-shard",
+    )
+    futures = [executor.submit(produce, index) for index in range(shard_count)]
+    try:
+        for index in range(shard_count):
+            while True:
+                kind, value = queues[index].get()
+                if kind == "row":
+                    yield value
+                elif kind == "error":
+                    raise RuntimeError(
+                        f"CulturaX shard {index} streaming failed: "
+                        f"{type(value).__name__}: {value}"
+                    ) from value
+                elif kind == "done":
+                    break
+                else:
+                    raise RuntimeError(f"Unknown shard queue item: {kind}")
+        for future in futures:
+            future.result()
+    finally:
+        stop.set()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _datasets_module() -> Any:
@@ -62,6 +170,7 @@ def stream_culturax_rows(config: DataPipelineConfig) -> Iterable[dict[str, Any]]
         )
         datasets = _datasets_module()
         stream = None
+        row_owner = None
         iterator = None
         try:
             try:
@@ -87,7 +196,8 @@ def stream_culturax_rows(config: DataPipelineConfig) -> Iterable[dict[str, Any]]
                 raise TimeoutError(
                     "Runtime cap exceeded while opening CulturaX stream"
                 )
-            iterator = iter(stream)
+            row_owner = _ordered_shard_rows(stream)
+            iterator = iter(row_owner)
             for _ in range(config.selection.max_input_documents):
                 if (
                     time.monotonic() - started
@@ -110,8 +220,9 @@ def stream_culturax_rows(config: DataPipelineConfig) -> Iterable[dict[str, Any]]
                 cache_limit.check()
                 yield row
         finally:
+            close_iterable(row_owner, iterator=iterator)
+            close_iterable(stream)
             cache_limit.check(force=True)
-            close_iterable(stream, iterator=iterator)
 
     return bounded_rows()
 
