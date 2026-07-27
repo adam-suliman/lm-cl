@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from lm_cl.cli._common import native_streaming_cli_entry, print_json
@@ -9,6 +10,7 @@ from lm_cl.config import load_data_pipeline_config
 from lm_cl.data.huggingface import stream_culturax_rows
 from lm_cl.data.materialize import (
     dry_run_materialization,
+    materialization_performance_settings,
     materialize_stage,
 )
 from lm_cl.data.tokenizer import load_verified_tokenizer
@@ -32,7 +34,9 @@ def run() -> None:
     config = load_data_pipeline_config(args.config)
     if config.mode != "culturax_stage_materialize":
         raise ValueError("Config mode must be culturax_stage_materialize")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     estimate = dry_run_materialization(config)
+    estimate["performance"] = materialization_performance_settings()
     if not args.execute:
         print_json({"status": "dry_run_only", **estimate})
         return
@@ -55,6 +59,11 @@ def run() -> None:
         rows=stream_culturax_rows(config),
         tokenizer=tokenizer,
         tokenizer_manifest=tokenizer_manifest,
+        progress_callback=lambda event: print(
+            json.dumps(event, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        ),
     )
     cleanup = None
     if (

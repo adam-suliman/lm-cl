@@ -8,6 +8,7 @@ from typing import Any, Iterable
 from lm_cl.config.data_schema import DataPipelineConfig
 from lm_cl.data.iteration import close_iterable
 from lm_cl.data.storage import (
+    PeriodicDiskLimitGuard,
     enforce_disk_limit,
     ensure_owned_root,
 )
@@ -54,6 +55,11 @@ def stream_culturax_rows(config: DataPipelineConfig) -> Iterable[dict[str, Any]]
 
     def bounded_rows() -> Iterable[dict[str, Any]]:
         started = time.monotonic()
+        cache_limit = PeriodicDiskLimitGuard(
+            cache_root,
+            config.storage.max_cache_bytes,
+            label="Hugging Face cache",
+        )
         datasets = _datasets_module()
         stream = None
         iterator = None
@@ -101,13 +107,10 @@ def stream_culturax_rows(config: DataPipelineConfig) -> Iterable[dict[str, Any]]
                     raise TimeoutError(
                         "Runtime cap exceeded while reading CulturaX stream"
                     )
-                enforce_disk_limit(
-                    cache_root,
-                    config.storage.max_cache_bytes,
-                    label="Hugging Face cache",
-                )
+                cache_limit.check()
                 yield row
         finally:
+            cache_limit.check(force=True)
             close_iterable(stream, iterator=iterator)
 
     return bounded_rows()

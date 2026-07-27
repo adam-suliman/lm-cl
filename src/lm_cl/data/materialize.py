@@ -4,11 +4,13 @@ import hashlib
 import json
 import os
 import platform
+import time
 from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
+from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -26,10 +28,10 @@ from lm_cl.data.storage import (
     FileLock,
     RuntimeGuard,
     atomic_write_json,
+    directory_size,
     enforce_disk_limit,
     ensure_owned_root,
     estimate_stage_bytes,
-    directory_size,
 )
 from lm_cl.data.tokenizer import (
     load_tokenizer_manifest,
@@ -42,6 +44,52 @@ from lm_cl.data.types import normalize_token_ids
 
 class SimulatedInterruption(RuntimeError):
     """Test-only abrupt interruption that may precede the next checkpoint."""
+
+
+MATERIALIZATION_ENGINE_VERSION = 2
+LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S = frozenset(
+    {
+        # Public release commit 56c2f08.  Engine v2 changes only execution:
+        # ordered batches, transaction cadence, and cap-check cadence.  The
+        # selection, tokenization, overlap, packing, and hash contracts remain
+        # unchanged, so its incomplete stages can be migrated explicitly.
+        "888f3af9474c74aab93ccdfa39c0a25b0ab223d1def241b70707aca7ea5fc30d",
+    }
+)
+
+
+def materialization_performance_settings() -> dict[str, Any]:
+    raw_batch_size = os.environ.get("LM_CL_TOKENIZER_BATCH_DOCUMENTS")
+    if raw_batch_size is None:
+        batch_size = min(4096, max(64, (os.cpu_count() or 1) * 16))
+    else:
+        try:
+            batch_size = int(raw_batch_size)
+        except ValueError as exc:
+            raise ValueError(
+                "LM_CL_TOKENIZER_BATCH_DOCUMENTS must be an integer"
+            ) from exc
+        if batch_size <= 0 or batch_size > 16_384:
+            raise ValueError(
+                "LM_CL_TOKENIZER_BATCH_DOCUMENTS must be in [1, 16384]"
+            )
+    return {
+        "engine_version": MATERIALIZATION_ENGINE_VERSION,
+        "tokenizer_batch_documents": batch_size,
+        "tokenizers_parallelism": os.environ.get(
+            "TOKENIZERS_PARALLELISM", "unset"
+        ),
+        "rayon_num_threads": os.environ.get("RAYON_NUM_THREADS", "automatic"),
+        "registry_cache_mib": os.environ.get(
+            "LM_CL_REGISTRY_CACHE_MIB", "512"
+        ),
+        "registry_mmap_mib": os.environ.get(
+            "LM_CL_REGISTRY_MMAP_MIB", "4096"
+        ),
+        "overlap_commit_policy": "stage_checkpoint_v1",
+        "generated_cap_policy": "preflight_bound_and_final_check_v1",
+        "cache_cap_check_interval_seconds": 5,
+    }
 
 
 def _source_tree_sha256() -> str:
@@ -78,20 +126,107 @@ def _package_versions() -> dict[str, str | None]:
 
 
 def _config_fingerprint(
-    config: DataPipelineConfig, tokenizer_manifest: dict[str, Any]
+    config: DataPipelineConfig,
+    tokenizer_manifest: dict[str, Any],
+    *,
+    source_tree_sha256: str | None = None,
+    python_version: str | None = None,
+    package_versions: dict[str, str | None] | None = None,
 ) -> str:
     value = {
         "config": config.to_dict(),
         "tokenizer_manifest_content_sha256": tokenizer_manifest[
             "manifest_content_sha256"
         ],
-        "source_tree_sha256": _source_tree_sha256(),
-        "python_version": platform.python_version(),
-        "package_versions": _package_versions(),
+        "source_tree_sha256": source_tree_sha256 or _source_tree_sha256(),
+        "python_version": python_version or platform.python_version(),
+        "package_versions": (
+            _package_versions() if package_versions is None else package_versions
+        ),
     }
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def _software_record() -> dict[str, Any]:
+    return {
+        "package": "lm-cl",
+        "package_version": "0.1.0",
+        "source_tree_sha256": _source_tree_sha256(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "package_versions": _package_versions(),
+        "materialization_performance": materialization_performance_settings(),
+    }
+
+
+def _load_compatible_incomplete_manifest(
+    path: Path,
+    *,
+    config: DataPipelineConfig,
+    tokenizer_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("completion_status") != "incomplete":
+        raise ValueError("Resume checkpoint has invalid completion status")
+    current_fingerprint = _config_fingerprint(config, tokenizer_manifest)
+    if state.get("config_fingerprint") == current_fingerprint:
+        return state
+
+    previous_software = state.get("software")
+    if not isinstance(previous_software, dict):
+        raise ValueError("Resume configuration/tokenizer fingerprint mismatch")
+    previous_source = previous_software.get("source_tree_sha256")
+    previous_python = previous_software.get("python")
+    previous_packages = previous_software.get("package_versions")
+    if (
+        previous_source not in LEGACY_ORDERED_MATERIALIZATION_SOURCE_SHA256S
+        or not isinstance(previous_python, str)
+        or not isinstance(previous_packages, dict)
+    ):
+        raise ValueError("Resume configuration/tokenizer fingerprint mismatch")
+    legacy_fingerprint = _config_fingerprint(
+        config,
+        tokenizer_manifest,
+        source_tree_sha256=previous_source,
+        python_version=previous_python,
+        package_versions=previous_packages,
+    )
+    if state.get("config_fingerprint") != legacy_fingerprint:
+        raise ValueError("Resume configuration/tokenizer fingerprint mismatch")
+
+    migrated_at = datetime.now(timezone.utc).isoformat()
+    history = state.setdefault("software_history", [])
+    if not isinstance(history, list):
+        raise ValueError("Resume software history is invalid")
+    history.append(
+        {
+            "reason": "ordered_materialization_engine_v2_performance_upgrade",
+            "replaced_at_utc": migrated_at,
+            "config_fingerprint": state["config_fingerprint"],
+            "software": previous_software,
+        }
+    )
+    state["software"] = _software_record()
+    state["config_fingerprint"] = current_fingerprint
+    state["resume_protocol_version"] = 2
+    migrations = state.setdefault("resume_migrations", [])
+    if not isinstance(migrations, list):
+        raise ValueError("Resume migration history is invalid")
+    migrations.append(
+        {
+            "kind": "ordered_materialization_engine_v2",
+            "at_utc": migrated_at,
+            "from_source_tree_sha256": previous_source,
+            "to_source_tree_sha256": state["software"]["source_tree_sha256"],
+            "scientific_ordering_changed": False,
+            "packed_token_semantics_changed": False,
+        }
+    )
+    state["updated_at_utc"] = migrated_at
+    atomic_write_json(path, state)
+    return state
 
 
 def _base_incomplete_manifest(
@@ -101,7 +236,7 @@ def _base_incomplete_manifest(
     return {
         "schema_version": 1,
         "format_version": config.packing.format_version,
-        "resume_protocol_version": 1,
+        "resume_protocol_version": 2,
         "completion_status": "incomplete",
         "config_fingerprint": _config_fingerprint(config, tokenizer_manifest),
         "dataset": {
@@ -227,14 +362,7 @@ def _base_incomplete_manifest(
         "boundaries_checkpoint_bytes": 0,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "software": {
-            "package": "lm-cl",
-            "package_version": "0.1.0",
-            "source_tree_sha256": _source_tree_sha256(),
-            "python": platform.python_version(),
-            "platform": platform.platform(),
-            "package_versions": _package_versions(),
-        },
+        "software": _software_record(),
     }
 
 
@@ -268,13 +396,11 @@ def _load_or_initialize(
             raise FileExistsError(
                 f"Incomplete stage exists and resume=false: {stage_dir}"
             )
-        state = json.loads(incomplete_path.read_text(encoding="utf-8"))
-        if state.get("completion_status") != "incomplete":
-            raise ValueError("Resume checkpoint has invalid completion status")
-        if state.get("config_fingerprint") != _config_fingerprint(
-            config, tokenizer_manifest
-        ):
-            raise ValueError("Resume configuration/tokenizer fingerprint mismatch")
+        state = _load_compatible_incomplete_manifest(
+            incomplete_path,
+            config=config,
+            tokenizer_manifest=tokenizer_manifest,
+        )
         return state, False
     state = _base_incomplete_manifest(config, tokenizer_manifest)
     atomic_write_json(incomplete_path, state)
@@ -356,12 +482,70 @@ def _checkpoint(
     atomic_write_json(incomplete_path, state)
 
 
+def _ordered_batches(
+    values: Iterator[Any], batch_size: int
+) -> Iterator[list[Any]]:
+    while True:
+        batch = list(islice(values, batch_size))
+        if not batch:
+            return
+        yield batch
+
+
+def _encode_document_batch(
+    tokenizer: Any,
+    texts: list[str],
+    *,
+    add_special_tokens: bool,
+) -> list[list[int] | None]:
+    """Encode in an ordered fast-tokenizer batch with exact scalar fallback."""
+    if not texts:
+        return []
+    if (
+        len(texts) > 1
+        and callable(tokenizer)
+        and getattr(tokenizer, "is_fast", False)
+    ):
+        try:
+            encoded = tokenizer(
+                texts,
+                add_special_tokens=add_special_tokens,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            values = encoded["input_ids"]
+            if len(values) != len(texts):
+                raise ValueError("Tokenizer batch output length mismatch")
+            return [normalize_token_ids(item) for item in values]
+        except Exception:
+            # Preserve the original per-document rejection behavior if a batch
+            # contains an input the tokenizer cannot encode.
+            pass
+    result: list[list[int] | None] = []
+    for text in texts:
+        try:
+            result.append(
+                normalize_token_ids(
+                    tokenizer.encode(
+                        text,
+                        add_special_tokens=add_special_tokens,
+                    )
+                )
+            )
+        except Exception:
+            result.append(None)
+    return result
+
+
 def materialize_stage(
     config: DataPipelineConfig,
     *,
     rows: Iterable[Mapping[str, Any]],
     tokenizer: Any,
     tokenizer_manifest: dict[str, Any] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     _interrupt_after_documents: int | None = None,
 ) -> dict[str, Any]:
     """Materialize a deterministic stage and release its live row stream."""
@@ -371,6 +555,7 @@ def materialize_stage(
             rows=rows,
             tokenizer=tokenizer,
             tokenizer_manifest=tokenizer_manifest,
+            progress_callback=progress_callback,
             _interrupt_after_documents=_interrupt_after_documents,
         )
     finally:
@@ -383,6 +568,7 @@ def _materialize_stage(
     rows: Iterable[Mapping[str, Any]],
     tokenizer: Any,
     tokenizer_manifest: dict[str, Any] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     _interrupt_after_documents: int | None = None,
 ) -> dict[str, Any]:
     """Materialize a deterministic stage without retaining raw text.
@@ -437,17 +623,11 @@ def _materialize_stage(
             raise FileExistsError(
                 f"Incomplete stage exists and resume=false: {stage_dir}"
             )
-        preview = json.loads(
-            preview_incomplete_path.read_text(encoding="utf-8")
+        preview = _load_compatible_incomplete_manifest(
+            preview_incomplete_path,
+            config=config,
+            tokenizer_manifest=tokenizer_manifest,
         )
-        if preview.get("completion_status") != "incomplete":
-            raise ValueError("Resume checkpoint has invalid completion status")
-        if preview.get("config_fingerprint") != _config_fingerprint(
-            config, tokenizer_manifest
-        ):
-            raise ValueError(
-                "Resume configuration/tokenizer fingerprint mismatch"
-            )
         remaining_token_budget = max(
             config.selection.max_output_tokens
             - int(preview.get("token_count", 0)),
@@ -526,9 +706,7 @@ def _materialize_stage(
                 if registered_count > state["accepted_document_count"]:
                     registry.truncate_stage(
                         config.stage.stage_id,
-                        keep_document_count=state[
-                            "accepted_document_count"
-                        ],
+                        keep_document_count=state["accepted_document_count"],
                     )
                     registered_count = registry.count_for_stage(
                         config.stage.stage_id
@@ -538,13 +716,12 @@ def _materialize_stage(
                     )
                 if registered_count and registered_max != registered_count - 1:
                     raise ValueError(
-                        "Current-stage overlap registry indices are not "
-                        "contiguous"
+                        "Current-stage overlap registry indices are not contiguous"
                     )
                 recovered_count = 0
                 for item in _boundary_records(boundary_path):
                     if item["document_index"] >= registered_count:
-                        registry.register(
+                        registry.insert_prechecked(
                             content_sha256=item["content_sha256"],
                             token_ids_sha256=item["token_ids_sha256"],
                             stage_id=config.stage.stage_id,
@@ -557,10 +734,10 @@ def _materialize_stage(
                             token_end=item["token_end"],
                         )
                     recovered_count += 1
+                registry.commit()
                 if recovered_count != state["accepted_document_count"]:
                     raise ValueError(
-                        "Boundary checkpoint count differs from incomplete "
-                        "manifest"
+                        "Boundary checkpoint count differs from incomplete manifest"
                     )
                 if (
                     registry.count_for_stage(config.stage.stage_id)
@@ -570,19 +747,40 @@ def _materialize_stage(
                         "Recovered overlap registry count differs from "
                         "incomplete manifest"
                     )
+
                 assert config.dataset.text_field is not None
-                selected = select_documents(
-                    rows,
-                    text_field=config.dataset.text_field,
-                    id_field=config.dataset.id_field,
-                    purpose=config.stage.purpose,
-                    config=config.selection,
-                    rejection_counts=selection_rejections,
-                    counters=counters,
+                selected = iter(
+                    select_documents(
+                        rows,
+                        text_field=config.dataset.text_field,
+                        id_field=config.dataset.id_field,
+                        purpose=config.stage.purpose,
+                        config=config.selection,
+                        rejection_counts=selection_rejections,
+                        counters=counters,
+                    )
                 )
-                last_checkpoint_selected = int(
-                    state["selected_document_count"]
+                batch_size = int(
+                    materialization_performance_settings()[
+                        "tokenizer_batch_documents"
+                    ]
                 )
+                last_checkpoint_selected = int(state["selected_document_count"])
+                invocation_started = time.monotonic()
+                invocation_start_tokens = writer.total_tokens
+                pending_token_arrays: list[np.ndarray] = []
+                pending_token_count = 0
+
+                def current_token_count() -> int:
+                    return writer.total_tokens + pending_token_count
+
+                def flush_pending_tokens() -> None:
+                    nonlocal pending_token_arrays, pending_token_count
+                    if not pending_token_arrays:
+                        return
+                    writer.append(np.concatenate(pending_token_arrays))
+                    pending_token_arrays = []
+                    pending_token_count = 0
 
                 def checkpoint_if_due(*, force: bool = False) -> None:
                     nonlocal last_checkpoint_selected
@@ -591,170 +789,246 @@ def _materialize_stage(
                         - last_checkpoint_selected
                     )
                     if (
-                        force
-                        or processed
-                        >= config.stage.checkpoint_every_candidates
+                        not force
+                        and processed < config.stage.checkpoint_every_candidates
                     ):
-                        _checkpoint(
-                            state=state,
-                            writer=writer,
-                            boundary_handle=boundary_handle,
-                            incomplete_path=incomplete_path,
-                            counters=counters,
-                            selection_rejections=selection_rejections,
-                            processing_rejections=processing_rejections,
-                        )
-                        last_checkpoint_selected = int(
-                            state["selected_document_count"]
-                        )
-
-                for selected_index, (document, split) in enumerate(selected):
-                    runtime.check()
-                    enforce_disk_limit(
-                        cache_root,
-                        config.storage.max_cache_bytes,
-                        label="Hugging Face cache",
+                        return
+                    flush_pending_tokens()
+                    # A registry commit ahead of the atomic manifest is safe:
+                    # resume truncates any rows beyond the manifest checkpoint.
+                    registry.commit()
+                    _checkpoint(
+                        state=state,
+                        writer=writer,
+                        boundary_handle=boundary_handle,
+                        incomplete_path=incomplete_path,
+                        counters=counters,
+                        selection_rejections=selection_rejections,
+                        processing_rejections=processing_rejections,
                     )
-                    if selected_index < skip_selected:
-                        continue
-                    state["selected_document_count"] += 1
-                    existing = registry.lookup(document.content_sha256)
-                    if existing is not None:
-                        if existing["stage_id"] == config.stage.stage_id:
-                            processing_rejections["duplicate_within_stage"] = (
-                                processing_rejections.get(
-                                    "duplicate_within_stage", 0
-                                )
-                                + 1
-                            )
-                        else:
-                            processing_rejections["overlap_registry"] = (
-                                processing_rejections.get(
-                                    "overlap_registry", 0
-                                )
-                                + 1
-                            )
-                        checkpoint_if_due()
-                        continue
-                    try:
-                        token_ids = normalize_token_ids(
-                            tokenizer.encode(
-                                document.text,
-                                add_special_tokens=(
-                                    config.packing.add_special_tokens
+                    last_checkpoint_selected = int(
+                        state["selected_document_count"]
+                    )
+                    if progress_callback is not None:
+                        elapsed = max(
+                            time.monotonic() - invocation_started, 1e-12
+                        )
+                        added = (
+                            int(state["token_count"])
+                            - invocation_start_tokens
+                        )
+                        progress_callback(
+                            {
+                                "event": "materialization_progress",
+                                "stage_id": config.stage.stage_id,
+                                "token_count": int(state["token_count"]),
+                                "target_token_count": (
+                                    config.selection.max_output_tokens
                                 ),
-                            )
+                                "accepted_document_count": int(
+                                    state["accepted_document_count"]
+                                ),
+                                "selected_document_count": int(
+                                    state["selected_document_count"]
+                                ),
+                                "input_document_count": int(
+                                    state["input_document_count"]
+                                ),
+                                "invocation_elapsed_seconds": elapsed,
+                                "invocation_added_tokens": added,
+                                "invocation_tokens_per_second": added / elapsed,
+                            }
                         )
-                    except Exception:
-                        processing_rejections["tokenization_error"] = (
-                            processing_rejections.get("tokenization_error", 0)
-                            + 1
-                        )
-                        checkpoint_if_due()
-                        continue
-                    if not token_ids:
-                        processing_rejections["empty_tokenization"] = (
-                            processing_rejections.get("empty_tokenization", 0) + 1
-                        )
-                        checkpoint_if_due()
-                        continue
-                    if (
-                        min(token_ids) < 0
-                        or max(token_ids)
-                        > config.tokenizer.maximum_emitted_token_id
-                        or max(token_ids)
-                        >= config.tokenizer.model_embedding_vocab_size
-                    ):
-                        processing_rejections["token_id_out_of_range"] = (
-                            processing_rejections.get(
-                                "token_id_out_of_range", 0
-                            )
-                            + 1
-                        )
-                        checkpoint_if_due()
-                        continue
-                    token_ids_sha256 = hashlib.sha256(
-                        np.asarray(token_ids, dtype="<u4").tobytes()
-                    ).hexdigest()
-                    token_existing = registry.lookup_token_ids(
-                        token_ids_sha256
-                    )
-                    if token_existing is not None:
-                        processing_rejections["token_sequence_overlap"] = (
-                            processing_rejections.get(
-                                "token_sequence_overlap", 0
-                            )
-                            + 1
-                        )
-                        checkpoint_if_due()
-                        continue
 
-                    remaining = (
-                        config.selection.max_output_tokens - writer.total_tokens
+                selected_cursor = 0
+                reached_target = False
+                for selected_batch in _ordered_batches(selected, batch_size):
+                    runtime.check()
+                    preexisting: list[dict[str, Any] | None] = []
+                    candidate_positions: list[int] = []
+                    candidate_texts: list[str] = []
+                    for offset, (document, _) in enumerate(selected_batch):
+                        selected_index = selected_cursor + offset
+                        if selected_index < skip_selected:
+                            preexisting.append(None)
+                            continue
+                        existing = registry.lookup(document.content_sha256)
+                        preexisting.append(existing)
+                        if existing is None:
+                            candidate_positions.append(offset)
+                            candidate_texts.append(document.text)
+                    selected_cursor += len(selected_batch)
+                    encoded_candidates = _encode_document_batch(
+                        tokenizer,
+                        candidate_texts,
+                        add_special_tokens=config.packing.add_special_tokens,
                     )
-                    if remaining <= 1:
-                        processing_rejections["insufficient_token_budget"] = (
-                            processing_rejections.get(
-                                "insufficient_token_budget", 0
+                    encoded_by_position: dict[int, list[int] | None] = dict(
+                        zip(candidate_positions, encoded_candidates, strict=True)
+                    )
+
+                    for offset, (document, split) in enumerate(selected_batch):
+                        selected_index = (
+                            selected_cursor - len(selected_batch) + offset
+                        )
+                        if selected_index < skip_selected:
+                            continue
+                        runtime.check()
+                        state["selected_document_count"] += 1
+                        existing = preexisting[offset]
+                        if existing is None:
+                            # Catch a duplicate accepted earlier in this same batch.
+                            existing = registry.lookup(document.content_sha256)
+                        if existing is not None:
+                            reason = (
+                                "duplicate_within_stage"
+                                if existing["stage_id"] == config.stage.stage_id
+                                else "overlap_registry"
                             )
-                            + 1
+                            processing_rejections[reason] = (
+                                processing_rejections.get(reason, 0) + 1
+                            )
+                            checkpoint_if_due()
+                            continue
+
+                        token_ids = encoded_by_position[offset]
+                        if token_ids is None:
+                            processing_rejections["tokenization_error"] = (
+                                processing_rejections.get("tokenization_error", 0)
+                                + 1
+                            )
+                            checkpoint_if_due()
+                            continue
+                        if not token_ids:
+                            processing_rejections["empty_tokenization"] = (
+                                processing_rejections.get("empty_tokenization", 0)
+                                + 1
+                            )
+                            checkpoint_if_due()
+                            continue
+                        token_array = np.asarray(token_ids, dtype=np.int64)
+                        minimum_id = int(token_array.min())
+                        maximum_id = int(token_array.max())
+                        if (
+                            minimum_id < 0
+                            or maximum_id
+                            > config.tokenizer.maximum_emitted_token_id
+                            or maximum_id
+                            >= config.tokenizer.model_embedding_vocab_size
+                        ):
+                            processing_rejections["token_id_out_of_range"] = (
+                                processing_rejections.get(
+                                    "token_id_out_of_range", 0
+                                )
+                                + 1
+                            )
+                            checkpoint_if_due()
+                            continue
+                        token_u32 = np.asarray(token_array, dtype="<u4")
+                        token_ids_sha256 = hashlib.sha256(
+                            token_u32.tobytes()
+                        ).hexdigest()
+                        token_existing = registry.lookup_token_ids(
+                            token_ids_sha256
                         )
-                        break
-                    content_count = min(len(token_ids), remaining - 1)
-                    truncated = content_count < len(token_ids)
-                    packed = token_ids[:content_count] + [eos_token_id]
-                    token_start = writer.total_tokens
-                    writer.append(packed)
-                    token_end = writer.total_tokens
-                    document_index = int(state["accepted_document_count"])
-                    boundary = {
-                        "document_index": document_index,
-                        "source_id": document.source_id,
-                        "content_sha256": document.content_sha256,
-                        "token_ids_sha256": token_ids_sha256,
-                        "token_start": token_start,
-                        "content_token_count": content_count,
-                        "token_end": token_end,
-                        "eos_after": config.packing.eos_after_each_document,
-                        "truncated": truncated,
-                        "split": split,
-                    }
-                    boundary_handle.write(
-                        json.dumps(boundary, sort_keys=True, separators=(",", ":"))
-                        + "\n"
-                    )
-                    state["accepted_document_count"] += 1
-                    checkpoint_if_due()
-                    registry.register(
-                        content_sha256=document.content_sha256,
-                        token_ids_sha256=token_ids_sha256,
-                        stage_id=config.stage.stage_id,
-                        purpose=config.stage.purpose,
-                        language=config.stage.language,
-                        split=split,
-                        source_id=document.source_id,
-                        document_index=document_index,
-                        token_start=token_start,
-                        token_end=token_end,
-                    )
-                    enforce_disk_limit(
-                        generated_root,
-                        config.storage.max_generated_bytes,
-                        label="Generated data",
-                    )
-                    if (
-                        _interrupt_after_documents is not None
-                        and state["accepted_document_count"]
-                        >= _interrupt_after_documents
-                    ):
-                        raise SimulatedInterruption(
-                            "Simulated interruption before the next forced checkpoint"
+                        if token_existing is not None:
+                            processing_rejections["token_sequence_overlap"] = (
+                                processing_rejections.get(
+                                    "token_sequence_overlap", 0
+                                )
+                                + 1
+                            )
+                            checkpoint_if_due()
+                            continue
+
+                        remaining = (
+                            config.selection.max_output_tokens
+                            - current_token_count()
                         )
-                    if writer.total_tokens >= config.selection.max_output_tokens:
+                        if remaining <= 1:
+                            processing_rejections["insufficient_token_budget"] = (
+                                processing_rejections.get(
+                                    "insufficient_token_budget", 0
+                                )
+                                + 1
+                            )
+                            reached_target = True
+                            break
+                        content_count = min(len(token_u32), remaining - 1)
+                        truncated = content_count < len(token_u32)
+                        packed = np.empty(content_count + 1, dtype="<u4")
+                        packed[:content_count] = token_u32[:content_count]
+                        packed[content_count] = eos_token_id
+                        token_start = current_token_count()
+                        pending_token_arrays.append(packed)
+                        pending_token_count += len(packed)
+                        token_end = current_token_count()
+                        document_index = int(state["accepted_document_count"])
+                        boundary = {
+                            "document_index": document_index,
+                            "source_id": document.source_id,
+                            "content_sha256": document.content_sha256,
+                            "token_ids_sha256": token_ids_sha256,
+                            "token_start": token_start,
+                            "content_token_count": content_count,
+                            "token_end": token_end,
+                            "eos_after": config.packing.eos_after_each_document,
+                            "truncated": truncated,
+                            "split": split,
+                        }
+                        boundary_handle.write(
+                            json.dumps(
+                                boundary,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        )
+                        state["accepted_document_count"] += 1
+                        registry.insert_prechecked(
+                            content_sha256=document.content_sha256,
+                            token_ids_sha256=token_ids_sha256,
+                            stage_id=config.stage.stage_id,
+                            purpose=config.stage.purpose,
+                            language=config.stage.language,
+                            split=split,
+                            source_id=document.source_id,
+                            document_index=document_index,
+                            token_start=token_start,
+                            token_end=token_end,
+                        )
+                        checkpoint_if_due()
+                        if (
+                            _interrupt_after_documents is not None
+                            and state["accepted_document_count"]
+                            >= _interrupt_after_documents
+                        ):
+                            raise SimulatedInterruption(
+                                "Simulated interruption before the next "
+                                "forced checkpoint"
+                            )
+                        if (
+                            current_token_count()
+                            >= config.selection.max_output_tokens
+                        ):
+                            reached_target = True
+                            break
+                    if reached_target:
                         break
+
+                checkpoint_if_due(force=True)
+                enforce_disk_limit(
+                    cache_root,
+                    config.storage.max_cache_bytes,
+                    label="Hugging Face cache",
+                )
+                enforce_disk_limit(
+                    generated_root,
+                    config.storage.max_generated_bytes,
+                    label="Generated data",
+                )
 
                 if state["accepted_document_count"] == 0:
-                    checkpoint_if_due(force=True)
                     raise ValueError(
                         "No documents were accepted; stage remains incomplete"
                     )
@@ -763,14 +1037,12 @@ def _materialize_stage(
                     and writer.total_tokens
                     != config.selection.max_output_tokens
                 ):
-                    checkpoint_if_due(force=True)
                     raise ValueError(
                         "Exact output-token budget was not reached; stage "
                         "remains incomplete: "
                         f"{writer.total_tokens} != "
                         f"{config.selection.max_output_tokens}"
                     )
-                checkpoint_if_due(force=True)
                 boundary_handle.close()
                 final_shards = writer.finalize()
                 boundaries = None

@@ -17,6 +17,48 @@ class DiskLimitError(RuntimeError):
     pass
 
 
+class PeriodicDiskLimitGuard:
+    """Amortize recursive cap checks while retaining bounded enforcement.
+
+    ``directory_size`` deliberately follows every owned file so it is much too
+    expensive to execute for every streamed document.  Callers still invoke
+    :meth:`check` in their hot loop, but the filesystem walk happens at most
+    once per interval.  Stage checkpoints and finalization use ``force=True``.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        max_bytes: int,
+        *,
+        label: str,
+        interval_seconds: float = 5.0,
+    ):
+        if max_bytes <= 0:
+            raise ValueError("Disk-limit maximum must be positive")
+        if interval_seconds <= 0:
+            raise ValueError("Disk-limit interval must be positive")
+        self.path = path
+        self.max_bytes = max_bytes
+        self.label = label
+        self.interval_seconds = interval_seconds
+        self._next_check = 0.0
+        self.last_used_bytes: int | None = None
+
+    def check(self, *, force: bool = False) -> int | None:
+        now = time.monotonic()
+        if not force and now < self._next_check:
+            return self.last_used_bytes
+        used = enforce_disk_limit(
+            self.path,
+            self.max_bytes,
+            label=self.label,
+        )
+        self.last_used_bytes = used
+        self._next_check = now + self.interval_seconds
+        return used
+
+
 def directory_size(path: Path) -> int:
     if not path.exists():
         return 0

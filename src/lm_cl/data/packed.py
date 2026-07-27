@@ -140,11 +140,17 @@ class PackedShardWriter:
         self._handle = (self.stage_dir / self.shards[-1]["filename"]).open("ab")
 
     def append(self, token_ids: Sequence[int] | np.ndarray) -> None:
-        array = np.asarray(token_ids, dtype=np.int64)
+        array = np.asarray(token_ids)
         if array.ndim != 1:
             raise ValueError("Packed token IDs must be one-dimensional")
-        if array.size and (array.min() < 0 or array.max() > np.iinfo(np.uint32).max):
+        if not np.issubdtype(array.dtype, np.integer):
+            raise ValueError("Packed token IDs must be integers")
+        if array.size and (
+            int(array.min()) < 0
+            or int(array.max()) > np.iinfo(np.uint32).max
+        ):
             raise ValueError("Token IDs must fit uint32")
+        array = np.asarray(array, dtype=UINT32_LE)
         cursor = 0
         while cursor < len(array):
             self._open_append_shard()

@@ -654,6 +654,7 @@ def prepare_or_validate_data(
         save_data_pipeline_config(pipeline, config_path)
         environment = dict(os.environ)
         environment.setdefault("HF_HOME", config.data.dataset_cache_root)
+        environment.setdefault("TOKENIZERS_PARALLELISM", "true")
         completed = subprocess.run(
             [
                 sys.executable,

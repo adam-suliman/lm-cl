@@ -22,6 +22,50 @@ stage. It uses a global overlap registry and distinct deterministic order seeds
 to enforce fresh appearances. Existing stages are checksum-validated and are
 never fetched again. Once all stages exist, the launcher operates offline.
 
+Materialization engine v2 keeps that stage order but removes hot-loop storage
+serialization. It tokenizes an ordered document batch through the fast
+tokenizer, buffers packed writes until the existing resumable checkpoint,
+commits the overlap registry once per checkpoint window, and amortizes
+recursive cache-cap scans. SQLite remains `synchronous=FULL`; the transaction
+is merely enlarged. A registry commit may be ahead of the atomic incomplete
+manifest after a crash, which is safe because resume already truncates registry
+rows, packed bytes, and boundary bytes back to the manifest checkpoint.
+
+The generated-data limit remains strictly admitted before a stage: the
+existing generated size plus the conservative maximum for all remaining token,
+boundary, registry, manifest, and temporary bytes must fit. It is checked again
+at finalization. The less predictable Hugging Face cache is checked during the
+stream at a bounded five-second cadence and forced at stream close.
+
+These execution settings do not enter packed scientific identity and may be
+tuned without changing order or bytes:
+
+```bash
+export TOKENIZERS_PARALLELISM=true
+export RAYON_NUM_THREADS="$(nproc)"
+export LM_CL_TOKENIZER_BATCH_DOCUMENTS=2048
+export LM_CL_REGISTRY_CACHE_MIB=4096
+export LM_CL_REGISTRY_MMAP_MIB=65536
+```
+
+Without an explicit batch size, the engine uses 16 documents per visible CPU,
+bounded to 64–4,096. An explicit value must be in 1–16,384. Larger batches use
+more transient RAM. Progress is emitted after every `checkpoint_every_candidates`
+window with cumulative tokens, documents, elapsed time, and invocation
+tokens/second.
+
+The registry defaults to a 512 MiB SQLite page cache and a 4 GiB mmap window.
+The larger values above are appropriate only on a high-memory machine; they do
+not preallocate or persist additional project data and do not alter registry
+contents.
+
+An incomplete stage produced by public release commit `56c2f08` is eligible
+for one explicit engine-v2 resume migration. The old configuration fingerprint
+is recomputed and must match before migration; no arbitrary source mismatch is
+accepted. The final manifest preserves the prior software record and records
+that ordering and packing semantics were unchanged. Complete manifests are
+never rewritten.
+
 Use `--manifest-only` or `--manifest-only-preflight` only after a full shard
 checksum validation has been recorded for those immutable files. These modes
 validate manifest identities but deliberately avoid rereading every token bin.

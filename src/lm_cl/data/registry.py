@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 
 REGISTRY_SCHEMA_VERSION = 2
+
+
+def _memory_setting(name: str, default_mib: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default_mib
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer MiB count") from exc
+    if value <= 0 or value > 262_144:
+        raise ValueError(f"{name} must be in [1, 262144] MiB")
+    return value
 
 
 class OverlapError(RuntimeError):
@@ -19,8 +33,13 @@ class OverlapRegistry:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
+        cache_mib = _memory_setting("LM_CL_REGISTRY_CACHE_MIB", 512)
+        mmap_mib = _memory_setting("LM_CL_REGISTRY_MMAP_MIB", 4096)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
+        self.connection.execute("PRAGMA temp_store=MEMORY")
+        self.connection.execute(f"PRAGMA cache_size=-{cache_mib * 1024}")
+        self.connection.execute(f"PRAGMA mmap_size={mmap_mib * 1024 * 1024}")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS metadata (
@@ -58,6 +77,10 @@ class OverlapRegistry:
 
     def close(self) -> None:
         self.connection.close()
+
+    def commit(self) -> None:
+        """Durably commit the current ordered insertion batch."""
+        self.connection.commit()
 
     def __enter__(self) -> "OverlapRegistry":
         return self
@@ -143,6 +166,54 @@ class OverlapRegistry:
                         token_end,
                     ),
                 )
+        except sqlite3.IntegrityError as exc:
+            raise OverlapError(
+                f"Document already registered: {content_sha256}"
+            ) from exc
+
+    def insert_prechecked(
+        self,
+        *,
+        content_sha256: str,
+        token_ids_sha256: str,
+        stage_id: str,
+        purpose: str,
+        language: str,
+        split: str,
+        source_id: str,
+        document_index: int,
+        token_start: int,
+        token_end: int,
+    ) -> None:
+        """Insert into the current transaction after both keys were checked.
+
+        Materialization owns the global overlap lock and processes documents in
+        one canonical order.  Delaying the commit until the existing stage
+        checkpoint boundary removes one synchronous filesystem transaction per
+        document without changing lookup visibility or accepted-document order.
+        """
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO documents(
+                    content_sha256, token_ids_sha256, stage_id, purpose,
+                    language, split_name, source_id, document_index,
+                    token_start, token_end
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    content_sha256,
+                    token_ids_sha256,
+                    stage_id,
+                    purpose,
+                    language,
+                    split,
+                    source_id,
+                    document_index,
+                    token_start,
+                    token_end,
+                ),
+            )
         except sqlite3.IntegrityError as exc:
             raise OverlapError(
                 f"Document already registered: {content_sha256}"
