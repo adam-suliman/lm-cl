@@ -35,6 +35,7 @@ from lm_cl.data.tokenizer import (
 from lm_cl.launcher.schema import (
     CYCLE_MANIFEST_POLICY,
     PUBLIC_LANGUAGE_ORDER,
+    WINDOWED_CYCLE_MANIFEST_POLICY,
     LauncherConfig,
     TokenBudget,
     resolve_token_budget,
@@ -356,6 +357,7 @@ def render_manifest_path(
         cycle=cycle,
         language=language,
         task_index=task_index,
+        source_task_index=PUBLIC_LANGUAGE_ORDER.index(language),
         effective_tokens=budget.effective_input_tokens,
     )
     root = Path(config.data.manifest_root).resolve()
@@ -365,6 +367,41 @@ def render_manifest_path(
     except ValueError as exc:
         raise ValueError("Rendered manifest escapes data.manifest_root") from exc
     return path
+
+
+def render_language_validation_manifest_path(
+    config: LauncherConfig,
+    *,
+    language: str,
+    budget: TokenBudget,
+) -> Path:
+    template = config.data.language_validation_manifest_template
+    if template is None:
+        raise ValueError("Language-validation manifest template is not configured")
+    relative = template.format(
+        language=language,
+        effective_tokens=budget.effective_input_tokens,
+    )
+    root = Path(config.data.manifest_root).resolve()
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "Rendered language-validation manifest escapes data.manifest_root"
+        ) from exc
+    return path
+
+
+def _source_task_budget(config: LauncherConfig) -> TokenBudget:
+    requested = config.experiment.tokens_per_task
+    if config.data.cycle_manifest_policy == WINDOWED_CYCLE_MANIFEST_POLICY:
+        requested *= config.experiment.cycles
+    return resolve_token_budget(
+        requested,
+        config.experiment.sequence_length,
+        policy=config.experiment.token_budget_policy,
+    )
 
 
 def _manifest_identity(
@@ -498,12 +535,13 @@ def resolve_data_contract(
             matrix.append(cycle_items)
         return {
             "mode": "synthetic",
-            "cycle_manifest_policy": CYCLE_MANIFEST_POLICY,
+            "cycle_manifest_policy": config.data.cycle_manifest_policy,
             "task_token_budget": task_budget.to_dict(),
             "probe_token_budget": probe_budget.to_dict(),
             "data_manifests": matrix,
             "probe_training_manifest": None,
             "probe_validation_manifest": None,
+            "language_validation_manifests": {},
             "tokenizer": None,
         }
 
@@ -513,40 +551,130 @@ def resolve_data_contract(
     matrix = []
     paths: set[str] = set()
     ordered_hashes: set[str] = set()
+    source_budget = _source_task_budget(config)
     for cycle in range(config.experiment.cycles):
         cycle_items = {}
         for language_index, language in enumerate(PUBLIC_LANGUAGE_ORDER):
             task_index = cycle * len(PUBLIC_LANGUAGE_ORDER) + language_index
+            windowed = (
+                config.data.cycle_manifest_policy
+                == WINDOWED_CYCLE_MANIFEST_POLICY
+            )
+            source_cycle = 0 if windowed else cycle
+            source_task_index = language_index if windowed else task_index
+            source_manifest_budget = source_budget if windowed else task_budget
             manifest_path = render_manifest_path(
                 config,
-                cycle=cycle,
+                cycle=source_cycle,
                 language=language,
-                task_index=task_index,
-                budget=task_budget,
+                task_index=source_task_index,
+                budget=source_manifest_budget,
             )
             identity = _manifest_identity(
                 manifest_path,
                 expected_language=language,
-                expected_cycle=cycle,
-                expected_task_index=task_index,
-                budget=task_budget,
+                expected_cycle=source_cycle,
+                expected_task_index=source_task_index,
+                budget=source_manifest_budget,
                 tokenizer_manifest=tokenizer_manifest,
                 tokenizer_manifest_file_sha256=tokenizer_file_sha,
                 full_checksum_validation=full_checksum_validation,
             )
             identity["tokenizer_manifest_path"] = config.data.tokenizer_manifest
-            if identity["manifest_path"] in paths:
+            if windowed:
+                sequence_start = (
+                    cycle * task_budget.effective_complete_sequences
+                )
+                sequence_end = (
+                    sequence_start + task_budget.effective_complete_sequences
+                )
+                if sequence_end > identity["packed_complete_sequence_count"]:
+                    raise ValueError(
+                        "Disjoint sequence window exceeds its frozen source "
+                        f"manifest: {manifest_path}"
+                    )
+                view = {
+                    "policy": WINDOWED_CYCLE_MANIFEST_POLICY,
+                    "logical_cycle_index": cycle,
+                    "logical_task_index": task_index,
+                    "sequence_start": sequence_start,
+                    "sequence_count": task_budget.effective_complete_sequences,
+                    "sequence_end_exclusive": sequence_end,
+                    "effective_input_tokens": task_budget.effective_input_tokens,
+                    "effective_valid_targets": task_budget.effective_valid_targets,
+                    "source_ordered_data_sha256": identity[
+                        "ordered_data_sha256"
+                    ],
+                }
+                view["view_ordered_data_sha256"] = canonical_sha256(view)
+                identity["sequence_window"] = view
+                unique_ordered_identity = view["view_ordered_data_sha256"]
+            else:
+                identity["sequence_window"] = {
+                    "policy": CYCLE_MANIFEST_POLICY,
+                    "logical_cycle_index": cycle,
+                    "logical_task_index": task_index,
+                    "sequence_start": 0,
+                    "sequence_count": task_budget.effective_complete_sequences,
+                    "sequence_end_exclusive": (
+                        task_budget.effective_complete_sequences
+                    ),
+                    "effective_input_tokens": task_budget.effective_input_tokens,
+                    "effective_valid_targets": task_budget.effective_valid_targets,
+                    "source_ordered_data_sha256": identity[
+                        "ordered_data_sha256"
+                    ],
+                    "view_ordered_data_sha256": identity[
+                        "ordered_data_sha256"
+                    ],
+                }
+                unique_ordered_identity = identity["ordered_data_sha256"]
+            if not windowed and identity["manifest_path"] in paths:
                 raise ValueError(
                     "fresh_disjoint_v1 prohibits manifest replay across appearances"
                 )
-            if identity["ordered_data_sha256"] in ordered_hashes:
+            if unique_ordered_identity in ordered_hashes:
                 raise ValueError(
-                    "fresh_disjoint_v1 requires distinct ordered-data identities"
+                    "Continual appearances require distinct ordered-data views"
                 )
             paths.add(identity["manifest_path"])
-            ordered_hashes.add(identity["ordered_data_sha256"])
+            ordered_hashes.add(unique_ordered_identity)
             cycle_items[language] = identity
         matrix.append(cycle_items)
+
+    language_validation: dict[str, dict[str, Any]] = {}
+    forgetting = config.forgetting
+    if forgetting is not None and forgetting.enabled:
+        validation_budget = resolve_token_budget(
+            forgetting.validation_sequences_per_language
+            * config.experiment.sequence_length,
+            config.experiment.sequence_length,
+            policy=config.experiment.token_budget_policy,
+        )
+        for language_index, language in enumerate(PUBLIC_LANGUAGE_ORDER):
+            manifest_path = render_language_validation_manifest_path(
+                config,
+                language=language,
+                budget=validation_budget,
+            )
+            identity = _manifest_identity(
+                manifest_path,
+                expected_language=language,
+                expected_cycle=0,
+                expected_task_index=800_000 + language_index,
+                budget=validation_budget,
+                tokenizer_manifest=tokenizer_manifest,
+                tokenizer_manifest_file_sha256=tokenizer_file_sha,
+                full_checksum_validation=full_checksum_validation,
+            )
+            if identity["purpose"] != "language_validation":
+                raise ValueError(
+                    f"Forgetting source is not language validation: {manifest_path}"
+                )
+            identity["tokenizer_manifest_path"] = (
+                config.data.tokenizer_manifest
+            )
+            language_validation[language] = identity
 
     probe_training = _manifest_identity(
         Path(config.data.probe_training_manifest or "").resolve(),
@@ -581,12 +709,12 @@ def resolve_data_contract(
         identity
         for cycle_items in matrix
         for identity in cycle_items.values()
-    ] + [probe_training, probe_validation]
-    lane_paths = [
+    ] + list(language_validation.values()) + [probe_training, probe_validation]
+    lane_paths = sorted({
         Path(identity["manifest_path"])
         for identity in identities
         if identity.get("preparation_lane_namespace") is not None
-    ]
+    })
     parallel_audit = None
     if lane_paths:
         records = _parallel_manifest_records(lane_paths)
@@ -603,12 +731,13 @@ def resolve_data_contract(
         parallel_audit = json.loads(audit_path.read_text(encoding="utf-8"))
     return {
         "mode": "packed",
-        "cycle_manifest_policy": CYCLE_MANIFEST_POLICY,
+        "cycle_manifest_policy": config.data.cycle_manifest_policy,
         "task_token_budget": task_budget.to_dict(),
         "probe_token_budget": probe_budget.to_dict(),
         "data_manifests": matrix,
         "probe_training_manifest": probe_training,
         "probe_validation_manifest": probe_validation,
+        "language_validation_manifests": language_validation,
         "parallel_preparation_audit": parallel_audit,
         "tokenizer": {
             **asdict(tokenizer_ref),
@@ -645,7 +774,7 @@ def data_pipeline_from_identity(
         mode="packed_shards",
         run_kind=(
             "production"
-            if config.experiment.run_kind == "production"
+            if config.experiment.run_kind != "functional_smoke"
             else "smoke"
         ),
         dataset=DatasetReference(
@@ -763,7 +892,7 @@ def materialization_config(
         mode="culturax_stage_materialize",
         run_kind=(
             "production"
-            if config.experiment.run_kind == "production"
+            if config.experiment.run_kind != "functional_smoke"
             else "smoke"
         ),
         dataset=DatasetReference(
@@ -868,20 +997,71 @@ def prepare_or_validate_data(
         / "preparation-configs"
         / config.experiment.name
     )
-    for cycle in range(config.experiment.cycles):
+    source_budget = _source_task_budget(config)
+    source_cycles = (
+        (0,)
+        if config.data.cycle_manifest_policy
+        == WINDOWED_CYCLE_MANIFEST_POLICY
+        else range(config.experiment.cycles)
+    )
+    for cycle in source_cycles:
         for language_index, language in enumerate(PUBLIC_LANGUAGE_ORDER):
-            task_index = cycle * len(PUBLIC_LANGUAGE_ORDER) + language_index
+            task_index = (
+                language_index
+                if config.data.cycle_manifest_policy
+                == WINDOWED_CYCLE_MANIFEST_POLICY
+                else cycle * len(PUBLIC_LANGUAGE_ORDER) + language_index
+            )
             pipeline, manifest_path = materialization_config(
                 config,
                 cycle=cycle,
                 language=language,
                 task_index=task_index,
-                budget=budget,
+                budget=(
+                    source_budget
+                    if config.data.cycle_manifest_policy
+                    == WINDOWED_CYCLE_MANIFEST_POLICY
+                    else budget
+                ),
             )
             expected_manifest_paths.append(manifest_path)
             if not manifest_path.is_file():
                 config_path = config_root / f"cycle-{cycle:04d}-{language}.yaml"
                 missing.append((pipeline, manifest_path, config_path))
+
+    forgetting = config.forgetting
+    if forgetting is not None and forgetting.enabled:
+        language_validation_budget = resolve_token_budget(
+            forgetting.validation_sequences_per_language
+            * config.experiment.sequence_length,
+            config.experiment.sequence_length,
+            policy=config.experiment.token_budget_policy,
+        )
+        for language_index, language in enumerate(PUBLIC_LANGUAGE_ORDER):
+            manifest_path = render_language_validation_manifest_path(
+                config,
+                language=language,
+                budget=language_validation_budget,
+            )
+            expected_manifest_paths.append(manifest_path)
+            if manifest_path.is_file():
+                continue
+            pipeline, _ = materialization_config(
+                config,
+                cycle=0,
+                language=language,
+                task_index=800_000 + language_index,
+                budget=language_validation_budget,
+                manifest_path_override=manifest_path,
+                purpose="language_validation",
+            )
+            missing.append(
+                (
+                    pipeline,
+                    manifest_path,
+                    config_root / f"validation-{language}.yaml",
+                )
+            )
     probe_budget = resolve_token_budget(
         config.probe.training_tokens,
         config.experiment.sequence_length,
@@ -1007,9 +1187,7 @@ def prepare_or_validate_data(
         config, full_checksum_validation=full_checksum_validation
     )
     result["materialized_stage_count"] = len(missing)
-    result["validated_stage_count"] = (
-        config.experiment.cycles * len(PUBLIC_LANGUAGE_ORDER)
-    )
+    result["validated_stage_count"] = len(set(expected_manifest_paths))
     result["preparation_config_root"] = str(config_root)
     result["parallel_languages"] = parallel_languages
     result["parallel_preparation_audit"] = parallel_audit

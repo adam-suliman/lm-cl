@@ -22,7 +22,7 @@ from lm_cl.data import (
     open_token_batch_source,
     validate_packed_shards,
 )
-from lm_cl.metrics import JsonlMetricLogger
+from lm_cl.metrics import JsonlMetricLogger, update_forgetting_metrics
 from lm_cl.models import RMTZyphraTransformer, ZyphraTransformer
 from lm_cl.training.checkpoint import (
     CHECKPOINT_KIND,
@@ -154,6 +154,42 @@ def build_source(
     return source, _source_identity(source_config, source), -100
 
 
+def _task_window_source_identity(
+    source_identity: dict[str, Any], task: ContinualTaskConfig
+) -> dict[str, Any]:
+    identity = dict(source_identity)
+    count = task.train_sequence_prefix_count
+    if count is not None:
+        start = task.train_sequence_offset_count
+        window = {
+            "sequence_start": start,
+            "sequence_count": count,
+            "sequence_end_exclusive": start + count,
+            "input_token_count": count * task.train_source.sequence_length,
+        }
+        window["view_sha256"] = canonical_sha256(
+            {
+                "source": source_identity,
+                "window": window,
+            }
+        )
+        identity["sequence_window"] = window
+    return identity
+
+
+def _source_position_for_sequence(
+    source: Any, *, sequence_index: int, sequence_length: int
+) -> TokenPosition:
+    if sequence_index < 0:
+        raise ValueError("Sequence offset must be non-negative")
+    method = getattr(source, "position_for_global_sequence", None)
+    if method is None:
+        if sequence_index:
+            raise ValueError("Token source does not support sequence offsets")
+        return TokenPosition(0, 0)
+    return method(sequence_index, sequence_length=sequence_length)
+
+
 @dataclass
 class TrainerState:
     phase: str = "task_active"
@@ -189,6 +225,10 @@ class TrainerState:
     last_active_memory_clipped_grad_norm: float | None = None
     last_active_memory_norm: float | None = None
     last_encoded_write_memory_norm: float | None = None
+    forgetting_first_mean_loss: dict[str, float] = field(default_factory=dict)
+    forgetting_best_mean_loss: dict[str, float] = field(default_factory=dict)
+    forgetting_latest_mean_loss: dict[str, float] = field(default_factory=dict)
+    forgetting_evaluation_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -198,6 +238,15 @@ class TrainerState:
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "TrainerState":
+        values = dict(values)
+        defaults = cls()
+        for name in (
+            "forgetting_first_mean_loss",
+            "forgetting_best_mean_loss",
+            "forgetting_latest_mean_loss",
+            "forgetting_evaluation_count",
+        ):
+            values.setdefault(name, getattr(defaults, name))
         expected = set(cls().__dict__)
         unknown = sorted(set(values) - expected)
         missing = sorted(expected - set(values))
@@ -879,19 +928,28 @@ class ContinualTrainer:
                     raise RuntimeError(
                         "Validation source ended before its batch budget"
                     ) from exc
-                tensor_inputs = torch.from_numpy(batch.input_ids).to(self.device)
-                tensor_labels = torch.from_numpy(batch.labels).to(self.device)
-                with self._autocast():
-                    output = self._forward_model(
-                        tensor_inputs,
-                        tensor_labels,
-                        ignore_index=ignore_index,
-                        evaluation_root=evaluation_root,
-                    )
-                assert output.loss_sum is not None
-                loss_sum += float(output.loss_sum.detach().cpu())
-                targets += int(output.target_count.detach().cpu())
-                inputs += int(batch.input_ids.size)
+                physical = (
+                    self.config.optimization.physical_microbatch_sequences
+                )
+                for start in range(0, batch.input_ids.shape[0], physical):
+                    stop = min(start + physical, batch.input_ids.shape[0])
+                    tensor_inputs = torch.from_numpy(
+                        batch.input_ids[start:stop]
+                    ).to(self.device)
+                    tensor_labels = torch.from_numpy(
+                        batch.labels[start:stop]
+                    ).to(self.device)
+                    with self._autocast():
+                        output = self._forward_model(
+                            tensor_inputs,
+                            tensor_labels,
+                            ignore_index=ignore_index,
+                            evaluation_root=evaluation_root,
+                        )
+                    assert output.loss_sum is not None
+                    loss_sum += float(output.loss_sum.detach().cpu())
+                    targets += int(output.target_count.detach().cpu())
+                    inputs += int(tensor_inputs.numel())
         result = {
             "loss_sum": loss_sum,
             "valid_target_count": targets,
@@ -948,6 +1006,110 @@ class ContinualTrainer:
             )
         return results
 
+    def _forgetting_primary_result(
+        self, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.config.variant.memory_enabled:
+            primary = result.get("reset")
+            if not isinstance(primary, dict):
+                raise RuntimeError(
+                    "Memory forgetting evaluation lacks reset result"
+                )
+            return primary
+        return result
+
+    def _evaluate_forgetting(
+        self,
+        *,
+        completed_task_index: int,
+        current_validation: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if current_validation is None:
+            return None
+        representatives: dict[str, ContinualTaskConfig] = {}
+        for candidate in self.config.tasks[: completed_task_index + 1]:
+            if candidate.validation_source is not None:
+                representatives.setdefault(candidate.language, candidate)
+        if not representatives:
+            return None
+
+        current_task = self.config.tasks[completed_task_index]
+        evaluations: dict[str, dict[str, Any]] = {}
+        for language, representative in representatives.items():
+            if language == current_task.language:
+                evaluations[language] = self._forgetting_primary_result(
+                    current_validation
+                )
+                continue
+            mode = "reset" if self.config.variant.memory_enabled else None
+            result = self._evaluate_source_once(
+                representative,
+                memory_evaluation_mode=mode,
+                evaluation_root=(
+                    self._evaluation_root("reset")
+                    if self.config.variant.memory_enabled
+                    else None
+                ),
+            )
+            if result is None:
+                raise RuntimeError("Forgetting validation source disappeared")
+            evaluations[language] = result
+
+        current_mean_ce = {
+            language: float(result["mean_loss"])
+            for language, result in evaluations.items()
+        }
+        summary, first, best = update_forgetting_metrics(
+            current_mean_ce,
+            first_mean_ce=self.state.forgetting_first_mean_loss,
+            best_mean_ce=self.state.forgetting_best_mean_loss,
+        )
+        for language, result in evaluations.items():
+            summary["languages"][language]["validation"] = result
+        prior_language_rows = [
+            values
+            for language, values in summary["languages"].items()
+            if language != current_task.language
+        ]
+        summary.update(
+            {
+                "boundary_task_index": completed_task_index,
+                "boundary_task_number": completed_task_index + 1,
+                "cycle_index": current_task.cycle_index,
+                "just_trained_language": current_task.language,
+                "memory_evaluation_mode": (
+                    "reset"
+                    if self.config.variant.memory_enabled
+                    else "not_applicable"
+                ),
+                "prior_language_count": len(prior_language_rows),
+                "average_prior_language_forgetting_from_best_ce": (
+                    None
+                    if not prior_language_rows
+                    else sum(
+                        row["forgetting_from_best_ce"]
+                        for row in prior_language_rows
+                    )
+                    / len(prior_language_rows)
+                ),
+                "average_prior_language_ce_change_from_first": (
+                    None
+                    if not prior_language_rows
+                    else sum(
+                        row["ce_change_from_first"]
+                        for row in prior_language_rows
+                    )
+                    / len(prior_language_rows)
+                ),
+            }
+        )
+        self.state.forgetting_first_mean_loss = first
+        self.state.forgetting_best_mean_loss = best
+        self.state.forgetting_latest_mean_loss = current_mean_ce
+        self.state.forgetting_evaluation_count += 1
+        self._log("forgetting_evaluation", **summary)
+        return summary
+
     def _batch_iterator(
         self,
         source: Any,
@@ -955,13 +1117,19 @@ class ContinualTrainer:
         *,
         start: TokenPosition,
     ):
+        sequence_end = (
+            None
+            if task.train_sequence_prefix_count is None
+            else task.train_sequence_offset_count
+            + task.train_sequence_prefix_count
+        )
         return source.iter_batches(
             sequence_length=task.train_source.sequence_length,
             global_sequences_per_batch=(
                 self.config.optimization.global_sequences_per_logical_batch
             ),
             start=start,
-            sequence_prefix_count=task.train_sequence_prefix_count,
+            sequence_prefix_count=sequence_end,
         )
 
     def _run_impl(
@@ -1090,6 +1258,9 @@ class ContinualTrainer:
                 task.train_source,
                 model_vocab_size=self.config.model.vocab_size,
             )
+            source_identity = _task_window_source_identity(
+                source_identity, task
+            )
             if continuing:
                 if resume_payload["source_identity"] != source_identity:
                     raise ValueError(
@@ -1128,15 +1299,18 @@ class ContinualTrainer:
                 self.state.window_logical_batches = 0
                 self.state.window_valid_targets = 0
                 self.state.window_loss_sum = 0.0
-                self.state.source_position = _position_dict(
-                    TokenPosition(0, 0)
+                initial_position = _source_position_for_sequence(
+                    source,
+                    sequence_index=task.train_sequence_offset_count,
+                    sequence_length=task.train_source.sequence_length,
                 )
+                self.state.source_position = _position_dict(initial_position)
                 self.source_identity = source_identity
                 self.optimizer, self.scheduler = (
                     self._create_optimizer_scheduler(task)
                 )
                 self.optimizer.zero_grad(set_to_none=True)
-                start_position = TokenPosition(0, 0)
+                start_position = initial_position
                 self._reset_task_memory()
                 self._log(
                     "task_start",
@@ -1220,6 +1394,10 @@ class ContinualTrainer:
             if self.state.window_logical_batches:
                 self._optimizer_step(tail_flush=True)
             validation = self._evaluate_source(task)
+            forgetting = self._evaluate_forgetting(
+                completed_task_index=task_index,
+                current_validation=validation,
+            )
             self._log(
                 "task_end",
                 loss_sum=self.state.task_loss_sum,
@@ -1230,6 +1408,7 @@ class ContinualTrainer:
                 input_token_count=self.state.task_input_tokens,
                 optimizer_generation=self._optimizer_generation,
                 validation=validation,
+                forgetting=forgetting,
             )
             self.state.phase = "task_boundary"
             self.state.next_task_index = task_index + 1
@@ -1346,24 +1525,33 @@ def evaluate_clean_checkpoint(
                     raise RuntimeError(
                         "Evaluation source ended before budget"
                     ) from exc
-                with evaluation_autocast():
-                    if isinstance(model, RMTZyphraTransformer):
-                        output = model(
-                            torch.from_numpy(batch.input_ids).to(device),
-                            torch.from_numpy(batch.labels).to(device),
-                            root_memory=root,
-                            ignore_index=ignore_index,
-                        )
-                    else:
-                        output = model(
-                            torch.from_numpy(batch.input_ids).to(device),
-                            torch.from_numpy(batch.labels).to(device),
-                            ignore_index=ignore_index,
-                        )
-                assert output.loss_sum is not None
-                loss_sum += float(output.loss_sum.detach().cpu())
-                targets += int(output.target_count.detach().cpu())
-                inputs += int(batch.input_ids.size)
+                physical = config.optimization.physical_microbatch_sequences
+                for start in range(0, batch.input_ids.shape[0], physical):
+                    stop = min(start + physical, batch.input_ids.shape[0])
+                    tensor_inputs = torch.from_numpy(
+                        batch.input_ids[start:stop]
+                    ).to(device)
+                    tensor_labels = torch.from_numpy(
+                        batch.labels[start:stop]
+                    ).to(device)
+                    with evaluation_autocast():
+                        if isinstance(model, RMTZyphraTransformer):
+                            output = model(
+                                tensor_inputs,
+                                tensor_labels,
+                                root_memory=root,
+                                ignore_index=ignore_index,
+                            )
+                        else:
+                            output = model(
+                                tensor_inputs,
+                                tensor_labels,
+                                ignore_index=ignore_index,
+                            )
+                    assert output.loss_sum is not None
+                    loss_sum += float(output.loss_sum.detach().cpu())
+                    targets += int(output.target_count.detach().cpu())
+                    inputs += int(tensor_inputs.numel())
         return {
             "checkpoint_path": str(Path(checkpoint_path).resolve()),
             "task_index": task_index,

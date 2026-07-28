@@ -23,6 +23,11 @@ PUBLIC_MODEL_VARIANTS = {
 }
 TOKEN_BUDGET_POLICY = "floor_complete_sequences_v1"
 CYCLE_MANIFEST_POLICY = "fresh_disjoint_v1"
+WINDOWED_CYCLE_MANIFEST_POLICY = "disjoint_sequence_windows_v1"
+CYCLE_MANIFEST_POLICIES = {
+    CYCLE_MANIFEST_POLICY,
+    WINDOWED_CYCLE_MANIFEST_POLICY,
+}
 PRIMARY_PROBE_MODE = "system"
 
 
@@ -95,9 +100,14 @@ class ExperimentSettings:
     def validate(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self.name):
             raise ValueError("experiment.name must be a safe path component")
-        if self.run_kind not in {"production", "functional_smoke"}:
+        if self.run_kind not in {
+            "production",
+            "scaled_budget",
+            "functional_smoke",
+        }:
             raise ValueError(
-                "experiment.run_kind must be production or functional_smoke"
+                "experiment.run_kind must be production, scaled_budget, or "
+                "functional_smoke"
             )
         valid_sizes = {"5m", "12m"}
         if self.run_kind == "functional_smoke":
@@ -151,6 +161,7 @@ class DataSettings:
     generated_root: str
     probe_training_manifest: str | None
     probe_validation_manifest: str | None
+    language_validation_manifest_template: str | None = None
     max_cache_bytes: int = 21_474_836_480
     max_generated_bytes: int = 429_496_729_600
     max_temporary_bytes: int = 2_147_483_648
@@ -165,9 +176,10 @@ class DataSettings:
     def validate(self, experiment: ExperimentSettings) -> None:
         if self.mode not in {"packed", "synthetic"}:
             raise ValueError("data.mode must be packed or synthetic")
-        if self.cycle_manifest_policy != CYCLE_MANIFEST_POLICY:
+        if self.cycle_manifest_policy not in CYCLE_MANIFEST_POLICIES:
             raise ValueError(
-                f"data.cycle_manifest_policy must be {CYCLE_MANIFEST_POLICY}"
+                "data.cycle_manifest_policy must be one of "
+                f"{sorted(CYCLE_MANIFEST_POLICIES)}"
             )
         if self.mode == "packed":
             required = {
@@ -193,6 +205,7 @@ class DataSettings:
                     cycle=0,
                     language="en",
                     task_index=0,
+                    source_task_index=0,
                     effective_tokens=experiment.tokens_per_task,
                 )
             except (KeyError, IndexError, ValueError) as exc:
@@ -203,6 +216,34 @@ class DataSettings:
                 raise ValueError(
                     "data.manifest_template must be a relative safe path"
                 )
+            if self.language_validation_manifest_template is not None:
+                if not self.language_validation_manifest_template.endswith(
+                    "manifest.json"
+                ):
+                    raise ValueError(
+                        "data.language_validation_manifest_template must end "
+                        "in manifest.json"
+                    )
+                try:
+                    validation_rendered = (
+                        self.language_validation_manifest_template.format(
+                            language="en",
+                            effective_tokens=experiment.sequence_length,
+                        )
+                    )
+                except (KeyError, IndexError, ValueError) as exc:
+                    raise ValueError(
+                        "data.language_validation_manifest_template has an "
+                        "unsupported placeholder"
+                    ) from exc
+                if (
+                    Path(validation_rendered).is_absolute()
+                    or ".." in Path(validation_rendered).parts
+                ):
+                    raise ValueError(
+                        "data.language_validation_manifest_template must be "
+                        "a relative safe path"
+                    )
         elif experiment.run_kind != "functional_smoke":
             raise ValueError("Synthetic data is limited to functional_smoke runs")
         for name, value in (
@@ -398,6 +439,78 @@ class ProbeSettings:
 
 
 @dataclass(frozen=True)
+class ForgettingSettings:
+    enabled: bool
+    evaluation_schedule: str
+    validation_sequences_per_language: int
+    primary_memory_evaluation_mode: str
+    metric: str
+
+    @classmethod
+    def disabled(cls) -> "ForgettingSettings":
+        return cls(
+            enabled=False,
+            evaluation_schedule="after_each_task_boundary",
+            validation_sequences_per_language=0,
+            primary_memory_evaluation_mode="reset",
+            metric="mean_validation_ce_from_best_v1",
+        )
+
+    def validate(
+        self,
+        experiment: ExperimentSettings,
+        data: DataSettings,
+        training: TrainingSettings,
+    ) -> None:
+        if self.evaluation_schedule != "after_each_task_boundary":
+            raise ValueError(
+                "forgetting.evaluation_schedule must be "
+                "after_each_task_boundary"
+            )
+        if self.primary_memory_evaluation_mode != "reset":
+            raise ValueError(
+                "Forgetting must use reset memory for slow/backbone comparability"
+            )
+        if self.metric != "mean_validation_ce_from_best_v1":
+            raise ValueError(
+                "forgetting.metric must be mean_validation_ce_from_best_v1"
+            )
+        if not self.enabled:
+            if self.validation_sequences_per_language != 0:
+                raise ValueError(
+                    "Disabled forgetting requires zero validation sequences"
+                )
+            return
+        if data.mode != "packed":
+            raise ValueError(
+                "Forgetting evaluation currently requires packed held-out data"
+            )
+        if data.language_validation_manifest_template is None:
+            raise ValueError(
+                "Enabled forgetting requires "
+                "data.language_validation_manifest_template"
+            )
+        if self.validation_sequences_per_language <= 0:
+            raise ValueError(
+                "Enabled forgetting requires positive validation sequences"
+            )
+        if (
+            self.validation_sequences_per_language
+            % training.global_batch_sequences
+        ):
+            raise ValueError(
+                "Forgetting validation sequences must divide the global "
+                "logical batch exactly"
+            )
+        resolve_token_budget(
+            self.validation_sequences_per_language
+            * experiment.sequence_length,
+            experiment.sequence_length,
+            policy=experiment.token_budget_policy,
+        )
+
+
+@dataclass(frozen=True)
 class LauncherConfig:
     schema_version: int
     experiment: ExperimentSettings
@@ -407,6 +520,7 @@ class LauncherConfig:
     launcher: LauncherSettings
     tracking: TrackingSettings
     probe: ProbeSettings
+    forgetting: ForgettingSettings | None = None
 
     def validate(self) -> None:
         if self.schema_version != LAUNCHER_SCHEMA_VERSION:
@@ -420,8 +534,22 @@ class LauncherConfig:
         self.launcher.validate(self.training)
         self.tracking.validate()
         self.probe.validate(self.experiment)
-        if self.experiment.run_kind == "production" and not self.probe.enabled:
-            raise ValueError("Production release runs require cycle-end probes")
+        forgetting = self.forgetting or ForgettingSettings.disabled()
+        forgetting.validate(self.experiment, self.data, self.training)
+        if (
+            self.experiment.run_kind in {"production", "scaled_budget"}
+            and not self.probe.enabled
+        ):
+            raise ValueError(
+                "Production and scaled-budget runs require cycle-end probes"
+            )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        # These optional fields postdate schema version 1.  Omitting inactive
+        # defaults keeps existing launcher/checkpoint identities resumable.
+        if values["data"].get("language_validation_manifest_template") is None:
+            values["data"].pop("language_validation_manifest_template", None)
+        if values.get("forgetting") is None:
+            values.pop("forgetting", None)
+        return values

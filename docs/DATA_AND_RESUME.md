@@ -17,6 +17,13 @@ five cycles need roughly 820 GB. The preset therefore caps owned generated
 data at 1 TiB. Provision that capacity plus checkpoint/output and filesystem
 reserve before preparing a five-cycle horizon.
 
+The scaled five-cycle 1B presets are different: they reuse five disjoint
+sequence windows inside each already materialized cycle-0 5B language stage.
+They create no additional continual-training token files. Only eight fixed
+1,280-sequence held-out language-validation stages are added (80 MiB of packed
+uint32 tokens total), plus manifests and boundary metadata. The Vietnamese
+probe reuses a 1B prefix of the existing frozen 5B probe-training stage.
+
 The preparation CLI normally runs one isolated materialization subprocess per
 missing stage. With `--parallel-languages N`, it instead runs up to `N`
 independent language lanes. Cycles remain sequential inside each lane, so later

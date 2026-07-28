@@ -147,6 +147,12 @@ class DistributedContinualTrainer(ContinualTrainer):
         *,
         start: TokenPosition,
     ) -> Iterator[TokenBatch]:
+        sequence_end = (
+            None
+            if task.train_sequence_prefix_count is None
+            else task.train_sequence_offset_count
+            + task.train_sequence_prefix_count
+        )
         return iter_partitioned_batches(
             source,
             sequence_length=task.train_source.sequence_length,
@@ -156,7 +162,7 @@ class DistributedContinualTrainer(ContinualTrainer):
             rank=self.distributed.rank,
             world_size=self.distributed.world_size,
             start=start,
-            sequence_prefix_count=task.train_sequence_prefix_count,
+            sequence_prefix_count=sequence_end,
         )
 
     def _restore_gradients(

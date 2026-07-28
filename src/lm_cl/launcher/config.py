@@ -13,6 +13,7 @@ from lm_cl.launcher.schema import (
     DataSettings,
     ExperimentSettings,
     FastMemSettings,
+    ForgettingSettings,
     LauncherConfig,
     LauncherSettings,
     ProbeSettings,
@@ -135,9 +136,10 @@ def config_from_mapping(root: dict[str, Any]) -> LauncherConfig:
         "launcher",
         "tracking",
         "probe",
+        "forgetting",
     }
     unknown = sorted(set(root) - expected)
-    missing = sorted(expected - set(root))
+    missing = sorted((expected - {"forgetting"}) - set(root))
     if unknown or missing:
         raise ValueError(
             f"Invalid launcher fields; unknown={unknown}, missing={missing}"
@@ -161,6 +163,13 @@ def config_from_mapping(root: dict[str, Any]) -> LauncherConfig:
             TrackingSettings, root["tracking"], "tracking"
         ),
         probe=strict_dataclass(ProbeSettings, root["probe"], "probe"),
+        forgetting=(
+            None
+            if root.get("forgetting") is None
+            else strict_dataclass(
+                ForgettingSettings, root["forgetting"], "forgetting"
+            )
+        ),
     )
     config.validate()
     _validate_safe_roots(config)

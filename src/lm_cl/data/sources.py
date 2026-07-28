@@ -48,6 +48,13 @@ class ArrayTokenSource:
             return TokenPosition(1, 0)
         return TokenPosition(0, offset)
 
+    def position_for_global_sequence(
+        self, sequence_index: int, *, sequence_length: int
+    ) -> TokenPosition:
+        if sequence_index < 0 or sequence_length <= 0:
+            raise ValueError("Invalid global sequence position")
+        return self._position(sequence_index * sequence_length)
+
     def iter_batches(
         self,
         *,
@@ -98,6 +105,21 @@ class SyntheticBatchSource:
     def __init__(self, config: DataConfig):
         self.config = config
         self.dataset = SyntheticTokenDataset(config)
+
+    def position_for_global_sequence(
+        self, sequence_index: int, *, sequence_length: int
+    ) -> TokenPosition:
+        if sequence_length != self.config.sequence_length:
+            raise ValueError(
+                "Requested sequence length differs from synthetic config"
+            )
+        if sequence_index < 0 or sequence_index > len(self.dataset):
+            raise ValueError("Global sequence position is outside synthetic data")
+        return (
+            TokenPosition(1, 0)
+            if sequence_index == len(self.dataset)
+            else TokenPosition(0, sequence_index)
+        )
 
     def iter_batches(
         self,

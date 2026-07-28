@@ -53,7 +53,7 @@ def _scientific_identity(
     seed: int,
     data_contract: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    identity = {
         "schema": "lm-cl-public-scientific-identity-v1",
         "public_model": public_model,
         "internal_variant": PUBLIC_MODEL_VARIANTS[public_model],
@@ -72,6 +72,9 @@ def _scientific_identity(
         "tokenizer": data_contract.get("tokenizer"),
         "cycle_manifest_policy": data_contract["cycle_manifest_policy"],
     }
+    if config.forgetting is not None:
+        identity["forgetting"] = asdict(config.forgetting)
+    return identity
 
 
 def expand_job_specs(
@@ -81,8 +84,10 @@ def expand_job_specs(
     output_root = Path(config.experiment.output_root).resolve()
     jobs: list[JobSpec] = []
     seen_paths: set[Path] = set()
-    for public_model in config.experiment.models:
-        for seed in config.experiment.seeds:
+    # Interleave model variants by seed so a paired comparison finishes in the
+    # first scheduler wave when jobs outnumber GPU slots.
+    for seed in config.experiment.seeds:
+        for public_model in config.experiment.models:
             output_dir = (
                 output_root
                 / config.experiment.name
@@ -294,6 +299,29 @@ def build_continual_job_config(
                 source = TrainSourceConfig(
                     kind="packed_shards", synthetic=None, packed=packed
                 )
+            validation_source = None
+            validation_logical_batches = 0
+            if config.forgetting is not None and config.forgetting.enabled:
+                validation_identity = data_contract[
+                    "language_validation_manifests"
+                ][language]
+                validation_source = TrainSourceConfig(
+                    kind="packed_shards",
+                    synthetic=None,
+                    packed=data_pipeline_from_identity(
+                        config,
+                        validation_identity,
+                        purpose="language_validation",
+                        global_sequences_per_batch=(
+                            config.training.global_batch_sequences
+                        ),
+                    ),
+                )
+                validation_logical_batches = (
+                    config.forgetting.validation_sequences_per_language
+                    // config.training.global_batch_sequences
+                )
+            window = identity.get("sequence_window", {})
             tasks.append(
                 ContinualTaskConfig(
                     language=language,
@@ -302,11 +330,14 @@ def build_continual_job_config(
                     logical_batches=None,
                     input_token_budget=budget["effective_input_tokens"],
                     train_source=source,
-                    validation_source=None,
-                    validation_logical_batches=0,
+                    validation_source=validation_source,
+                    validation_logical_batches=validation_logical_batches,
                     train_sequence_prefix_count=budget[
                         "effective_complete_sequences"
                     ],
+                    train_sequence_offset_count=int(
+                        window.get("sequence_start", 0)
+                    ),
                 )
             )
     job_dir = Path(spec.output_dir)
@@ -429,8 +460,8 @@ def build_probe_job_config(
         schema_version=1,
         run_name=f"{config.experiment.name}-{spec.job_id}-probe-cycle-{cycle_index + 1}",
         run_kind=(
-            "production"
-            if config.experiment.run_kind == "production"
+            config.experiment.run_kind
+            if config.experiment.run_kind in {"production", "scaled_budget"}
             else "smoke"
         ),
         source_checkpoint=str(Path(source_checkpoint).resolve()),

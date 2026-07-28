@@ -39,11 +39,26 @@ target-normalized.
 
 ## Data
 
-`cycle_manifest_policy` is fixed to `fresh_disjoint_v1`. `manifest_template`
-may use `{cycle}`, `{language}`, `{task_index}`, and `{effective_tokens}`. Each
+`cycle_manifest_policy` is either `fresh_disjoint_v1` or the explicitly scaled
+`disjoint_sequence_windows_v1`. `manifest_template` may use `{cycle}`,
+`{language}`, `{task_index}`, `{source_task_index}`, and `{effective_tokens}`. Each
 rendered path, manifest-file SHA-256, manifest-content SHA-256, ordered-data
 SHA-256, tokenizer identity, and requested/effective count is frozen in the
 resolved cycle×language matrix.
+
+The windowed policy materializes or opens one cycle-0 source per language whose
+requested budget is `cycles * tokens_per_task`. Logical cycle `c` reads the
+half-open complete-sequence interval
+`[c * task_sequences, (c + 1) * task_sequences)`. The resolved contract records
+the source hashes, exact range, and a distinct view SHA-256. Overlapping or
+out-of-range windows fail before launch.
+
+Enabled forgetting requires a `language_validation_manifest_template` and a
+positive validation count divisible by the global logical batch. Validation
+documents come from the stable held-out split. At every task boundary the model
+is evaluated on all languages seen so far. Lower CE is better; per-language
+forgetting is current CE minus the best CE previously observed for that
+language. FastMem uses reset M0 for this metric.
 
 The production `max_input_documents` value is 30,000,000. This is a fail-safe
 execution ceiling, not a target: materialization stops as soon as the exact

@@ -152,3 +152,35 @@ def log_record_to_tensorboard(
                 tracker.scalar(f"probe/{name}/{mode}", value, step)
                 if mode in {"not_applicable", "carried"}:
                     tracker.scalar(f"probe/{name}", value, step)
+    elif event == "forgetting_evaluation":
+        boundary = int(record["boundary_task_number"])
+        tracker.scalar(
+            "continual/average_forgetting_from_best_ce",
+            float(record["average_forgetting_from_best_ce"]),
+            boundary,
+        )
+        tracker.scalar(
+            "continual/average_ce_change_from_first",
+            float(record["average_ce_change_from_first"]),
+            boundary,
+        )
+        prior = record.get(
+            "average_prior_language_forgetting_from_best_ce"
+        )
+        if prior is not None:
+            tracker.scalar(
+                "continual/average_prior_language_forgetting_from_best_ce",
+                float(prior),
+                boundary,
+            )
+        for language, values in record.get("languages", {}).items():
+            tracker.scalar(
+                f"continual/validation_ce/{language}",
+                float(values["mean_validation_ce"]),
+                boundary,
+            )
+            tracker.scalar(
+                f"continual/forgetting_from_best_ce/{language}",
+                float(values["forgetting_from_best_ce"]),
+                boundary,
+            )

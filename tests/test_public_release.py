@@ -8,10 +8,12 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from lm_cl.launcher.config import load_launcher_config
 from lm_cl.launcher.data import resolve_data_contract
+from lm_cl.launcher import data as launcher_data
 from lm_cl.launcher.jobs import (
     build_continual_job_config,
     build_probe_job_config,
@@ -36,9 +38,12 @@ from lm_cl.launcher.state import (
     write_latest_pointer,
 )
 from lm_cl.metrics import JsonlMetricLogger, TensorBoardTracker
+from lm_cl.metrics import update_forgetting_metrics
+from lm_cl.config import DataConfig, TokenizerReference, TrainSourceConfig
 from lm_cl.training import ContinualTrainer, ProbeTrainer
 from lm_cl.training.checkpoint import load_checkpoint, sha256_file
 from lm_cl.training.distributed import state_digest
+from lm_cl.data.sources import ArrayTokenSource
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,10 +103,39 @@ def test_models_times_seeds_expand_to_complete_jobs(tmp_path):
     _, jobs = _jobs(config)
     assert [job.job_id for job in jobs] == [
         "transformer-seed-11",
-        "transformer-seed-12",
         "fastmem_rmt-seed-11",
+        "transformer-seed-12",
         "fastmem_rmt-seed-12",
     ]
+
+
+def test_inactive_new_launcher_fields_preserve_legacy_serialization(tmp_path):
+    config = _config(
+        tmp_path,
+        name="legacy-launcher-identity",
+        models=["transformer"],
+        cycles=1,
+        tensorboard=False,
+    )
+    serialized = config.to_dict()
+    assert "forgetting" not in serialized
+    assert "language_validation_manifest_template" not in serialized["data"]
+
+
+def test_zero_sequence_offsets_preserve_legacy_continual_serialization(tmp_path):
+    config = _config(
+        tmp_path,
+        name="legacy-continual-identity",
+        models=["transformer"],
+        cycles=1,
+        tensorboard=False,
+    )
+    _, jobs = _jobs(config)
+    continual = build_continual_job_config(config, jobs[0])
+    assert all(
+        "train_sequence_offset_count" not in task
+        for task in continual.to_dict()["tasks"]
+    )
 
 
 def test_one_job_contains_every_task_and_cycle(tmp_path):
@@ -120,6 +154,168 @@ def test_token_budget_is_explicit_complete_sequence_floor():
     assert budget.effective_input_tokens == 4_999_999_488
     assert budget.effective_valid_targets == 4_997_558_082
     assert budget.discarded_remainder_tokens == 512
+
+
+def test_five_one_billion_windows_exactly_fit_one_five_billion_source():
+    task = resolve_token_budget(1_000_000_000, 2048)
+    source = resolve_token_budget(5_000_000_000, 2048)
+    windows = [
+        (cycle * task.effective_complete_sequences, task.effective_complete_sequences)
+        for cycle in range(5)
+    ]
+    assert windows[-1][0] + windows[-1][1] <= source.effective_complete_sequences
+    assert source.effective_complete_sequences - sum(
+        count for _, count in windows
+    ) == 1
+    assert all(
+        left_start + left_count == right_start
+        for (left_start, left_count), (right_start, _) in zip(
+            windows, windows[1:]
+        )
+    )
+
+
+def test_sequence_window_reader_starts_at_offset_and_stops_at_exclusive_end():
+    source = ArrayTokenSource(np.arange(40, dtype=np.uint32))
+    start = source.position_for_global_sequence(2, sequence_length=4)
+    batches = list(
+        source.iter_batches(
+            sequence_length=4,
+            global_sequences_per_batch=2,
+            start=start,
+            sequence_prefix_count=4,
+        )
+    )
+    assert len(batches) == 1
+    assert batches[0].input_ids.tolist() == [
+        [8, 9, 10, 11],
+        [12, 13, 14, 15],
+    ]
+
+
+def test_windowed_data_contract_records_distinct_nonoverlapping_views(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LM_CL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("LM_CL_OUTPUT_ROOT", str(tmp_path / "output"))
+    config = load_launcher_config(
+        ROOT
+        / "configs/experiments/zyphra_fastmem_h100_5m_5cycle_1b.yaml"
+    )
+
+    tokenizer_manifest = {
+        "manifest_content_sha256": "1" * 64,
+        "repo_id": "Qwen/Qwen3-0.6B-Base",
+        "revision": "a" * 40,
+    }
+    monkeypatch.setattr(
+        launcher_data,
+        "_tokenizer_reference",
+        lambda config: (
+            TokenizerReference(
+                repo_id=tokenizer_manifest["repo_id"],
+                revision=tokenizer_manifest["revision"],
+                manifest_path=str(
+                    tmp_path / "data/generated/tokenizers/qwen3/manifest.json"
+                ),
+                base_vocab_size=151_643,
+                effective_vocab_size=151_669,
+                maximum_emitted_token_id=151_668,
+                model_embedding_vocab_size=151_680,
+                expected_eos_token_id=151_643,
+                expected_pad_token_id=151_643,
+            ),
+            tokenizer_manifest,
+            "2" * 64,
+        ),
+    )
+
+    def identity(path, **kwargs):
+        budget = kwargs["budget"]
+        language = kwargs["expected_language"]
+        purpose = (
+            "language_validation"
+            if "retention-validation" in str(path)
+            else (
+                "vietnamese_validation"
+                if "vi-validation" in str(path)
+                else (
+                    "vietnamese_train"
+                    if "vi-probe-train" in str(path)
+                    else "continual_train"
+                )
+            )
+        )
+        complete = (
+            2_441_406
+            if purpose in {"continual_train", "vietnamese_train"}
+            else 1_280
+        )
+        sequence_length = 2048
+        return {
+            "manifest_path": str(path),
+            "manifest_file_sha256": "3" * 64,
+            "manifest_content_sha256": "4" * 64,
+            "ordered_data_sha256": (language or "vi").encode().hex().ljust(64, "0")[:64],
+            "tokenizer_manifest_path": "",
+            "tokenizer_manifest_file_sha256": "2" * 64,
+            "tokenizer_manifest_content_sha256": "1" * 64,
+            "tokenizer_repo_id": tokenizer_manifest["repo_id"],
+            "tokenizer_revision": tokenizer_manifest["revision"],
+            "stage_id": Path(path).parent.name,
+            "purpose": purpose,
+            "language": language,
+            "cycle_index": kwargs["expected_cycle"],
+            "task_index": kwargs["expected_task_index"],
+            "preparation_lane_namespace": None,
+            "packed_token_count": complete * sequence_length,
+            "packed_target_token_count": complete * (sequence_length - 1),
+            "packed_complete_sequence_count": complete,
+            "requested_input_tokens": None if budget is None else budget.requested_input_tokens,
+            "effective_complete_sequences": complete if budget is None else budget.effective_complete_sequences,
+            "effective_input_tokens": complete * sequence_length if budget is None else budget.effective_input_tokens,
+            "effective_valid_targets": complete * (sequence_length - 1) if budget is None else budget.effective_valid_targets,
+            "sequence_length": sequence_length,
+        }
+
+    monkeypatch.setattr(launcher_data, "_manifest_identity", identity)
+    contract = resolve_data_contract(config, full_checksum_validation=False)
+    en_windows = [
+        cycle["en"]["sequence_window"]
+        for cycle in contract["data_manifests"]
+    ]
+    assert [item["sequence_start"] for item in en_windows] == [
+        0,
+        488_281,
+        976_562,
+        1_464_843,
+        1_953_124,
+    ]
+    assert len({item["view_ordered_data_sha256"] for item in en_windows}) == 5
+    assert set(contract["language_validation_manifests"]) == set(
+        PUBLIC_LANGUAGE_ORDER
+    )
+
+
+def test_lower_is_better_forgetting_is_measured_from_best_history():
+    first = {}
+    best = {}
+    _, first, best = update_forgetting_metrics(
+        {"en": 2.0}, first_mean_ce=first, best_mean_ce=best
+    )
+    _, first, best = update_forgetting_metrics(
+        {"en": 1.5, "zh_written": 3.0},
+        first_mean_ce=first,
+        best_mean_ce=best,
+    )
+    report, _, _ = update_forgetting_metrics(
+        {"en": 1.8, "zh_written": 3.2},
+        first_mean_ce=first,
+        best_mean_ce=best,
+    )
+    assert report["languages"]["en"]["forgetting_from_best_ce"] == pytest.approx(0.3)
+    assert report["languages"]["en"]["ce_change_from_first"] == pytest.approx(-0.2)
+    assert report["languages"]["zh_written"]["forgetting_from_best_ce"] == pytest.approx(0.2)
 
 
 def test_too_small_token_budget_fails():
@@ -429,6 +625,216 @@ def test_fastmem_resets_at_every_language(tiny_runs):
     _, _, _, _, result = tiny_runs["fastmem_rmt"]
     assert result.state["memory_reset_count"] == 8
     assert result.state["global_fast_updates"] == 16
+
+
+def test_task_boundaries_record_seen_language_forgetting_matrix(tmp_path):
+    config = _config(
+        tmp_path,
+        name="tiny-forgetting",
+        models=["transformer"],
+        cycles=1,
+        tensorboard=False,
+    )
+    data, jobs = _jobs(config)
+    continual = build_continual_job_config(config, jobs[0])
+    validation_sources = {}
+    for language_index, language in enumerate(PUBLIC_LANGUAGE_ORDER):
+        validation_sources[language] = TrainSourceConfig(
+            kind="synthetic",
+            synthetic=DataConfig(
+                backend="synthetic",
+                vocab_size=continual.model.vocab_size,
+                sequence_length=16,
+                num_sequences=1,
+                seed=7000 + language_index,
+                ignore_index=-100,
+                mask_probability=0.0,
+            ),
+            packed=None,
+        )
+    continual = replace(
+        continual,
+        tasks=[
+            replace(
+                task,
+                validation_source=validation_sources[task.language],
+                validation_logical_batches=1,
+            )
+            for task in continual.tasks
+        ],
+    )
+    continual.validate()
+    result = ContinualTrainer(continual).run()
+    assert result.state["forgetting_evaluation_count"] == 8
+    assert set(result.state["forgetting_latest_mean_loss"]) == set(
+        PUBLIC_LANGUAGE_ORDER
+    )
+    records = [
+        json.loads(line)
+        for line in (Path(jobs[0].output_dir) / "metrics.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    forgetting = [
+        record for record in records if record["event"] == "forgetting_evaluation"
+    ]
+    assert len(forgetting) == 8
+    assert list(forgetting[0]["languages"]) == ["en"]
+    assert set(forgetting[-1]["languages"]) == set(PUBLIC_LANGUAGE_ORDER)
+    assert forgetting[-1]["memory_evaluation_mode"] == "not_applicable"
+
+
+def _windowed_tiny_continual(tmp_path: Path, *, name: str):
+    config = _config(
+        tmp_path,
+        name=name,
+        models=["transformer"],
+        cycles=2,
+        tensorboard=False,
+    )
+    _, jobs = _jobs(config)
+    continual = build_continual_job_config(config, jobs[0])
+    expanded_sources = []
+    for task in continual.tasks[: len(PUBLIC_LANGUAGE_ORDER)]:
+        assert task.train_source.synthetic is not None
+        expanded_sources.append(
+            replace(task.train_source.synthetic, num_sequences=4)
+        )
+    tasks = []
+    for task in continual.tasks:
+        language_index = task.task_index % len(PUBLIC_LANGUAGE_ORDER)
+        tasks.append(
+            replace(
+                task,
+                train_source=TrainSourceConfig(
+                    kind="synthetic",
+                    synthetic=expanded_sources[language_index],
+                    packed=None,
+                ),
+                train_sequence_prefix_count=2,
+                train_sequence_offset_count=2 * task.cycle_index,
+            )
+        )
+    result = replace(continual, tasks=tasks)
+    result.validate()
+    return result
+
+
+def test_nonzero_sequence_window_interruption_resumes_exactly(tmp_path):
+    full_config = _windowed_tiny_continual(tmp_path / "full", name="window-full")
+    full = ContinualTrainer(full_config).run()
+
+    resume_config = _windowed_tiny_continual(
+        tmp_path / "resume", name="window-resume"
+    )
+    interrupted = ContinualTrainer(resume_config).run(
+        stop_after_global_logical_batches=17
+    )
+    assert interrupted.status == "interrupted"
+    payload = load_checkpoint(interrupted.checkpoint_path)
+    window = payload["source_identity"]["sequence_window"]
+    assert window["sequence_start"] == 2
+    assert window["sequence_count"] == 2
+    assert window["sequence_end_exclusive"] == 4
+    assert payload["trainer_state"]["current_task_index"] == 8
+    assert payload["trainer_state"]["source_position"] == {
+        "shard_index": 0,
+        "token_offset": 3,
+    }
+
+    resumed = ContinualTrainer(resume_config).run(
+        resume_checkpoint=interrupted.checkpoint_path
+    )
+    assert resumed.status == "complete"
+    assert resumed.loss_history == full.loss_history
+    full_payload = load_checkpoint(full.checkpoint_path)
+    resumed_payload = load_checkpoint(resumed.checkpoint_path)
+    assert state_digest(resumed_payload["model_state"]) == state_digest(
+        full_payload["model_state"]
+    )
+
+
+def _forgetting_tiny_continual(tmp_path: Path, *, name: str):
+    config = _config(
+        tmp_path,
+        name=name,
+        models=["fastmem_rmt"],
+        cycles=1,
+        tensorboard=False,
+    )
+    _, jobs = _jobs(config)
+    continual = build_continual_job_config(config, jobs[0])
+    tasks = []
+    for language_index, task in enumerate(continual.tasks):
+        validation = TrainSourceConfig(
+            kind="synthetic",
+            synthetic=DataConfig(
+                backend="synthetic",
+                vocab_size=continual.model.vocab_size,
+                sequence_length=16,
+                num_sequences=1,
+                seed=8000 + language_index,
+                ignore_index=-100,
+                mask_probability=0.0,
+            ),
+            packed=None,
+        )
+        tasks.append(
+            replace(
+                task,
+                validation_source=validation,
+                validation_logical_batches=1,
+            )
+        )
+    result = replace(continual, tasks=tasks)
+    result.validate()
+    return result
+
+
+def test_fastmem_forgetting_state_survives_task_boundary_resume(tmp_path):
+    full_config = _forgetting_tiny_continual(
+        tmp_path / "full", name="forgetting-full"
+    )
+    full = ContinualTrainer(full_config).run()
+
+    resume_config = _forgetting_tiny_continual(
+        tmp_path / "resume", name="forgetting-resume"
+    )
+    interrupted = ContinualTrainer(resume_config).run(
+        stop_after_task_boundaries=4
+    )
+    interrupted_payload = load_checkpoint(interrupted.checkpoint_path)
+    assert interrupted_payload["trainer_state"][
+        "forgetting_evaluation_count"
+    ] == 4
+    assert set(
+        interrupted_payload["trainer_state"][
+            "forgetting_latest_mean_loss"
+        ]
+    ) == set(PUBLIC_LANGUAGE_ORDER[:4])
+
+    resumed = ContinualTrainer(resume_config).run(
+        resume_checkpoint=interrupted.checkpoint_path
+    )
+    assert resumed.status == "complete"
+    assert resumed.state["forgetting_evaluation_count"] == 8
+    assert resumed.state["forgetting_first_mean_loss"] == (
+        full.state["forgetting_first_mean_loss"]
+    )
+    assert resumed.state["forgetting_best_mean_loss"] == (
+        full.state["forgetting_best_mean_loss"]
+    )
+    assert resumed.state["forgetting_latest_mean_loss"] == (
+        full.state["forgetting_latest_mean_loss"]
+    )
+    full_payload = load_checkpoint(full.checkpoint_path)
+    resumed_payload = load_checkpoint(resumed.checkpoint_path)
+    assert state_digest(resumed_payload["model_state"]) == state_digest(
+        full_payload["model_state"]
+    )
+    assert state_digest(resumed_payload["memory_state"]) == state_digest(
+        full_payload["memory_state"]
+    )
 
 
 def test_probe_is_derived_and_source_hash_is_immutable(tiny_runs):

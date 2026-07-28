@@ -181,10 +181,15 @@ def _task(root_path: Path, values: Any, index: int) -> ContinualTaskConfig:
         "validation_source",
         "validation_logical_batches",
         "train_sequence_prefix_count",
+        "train_sequence_offset_count",
     }
     unknown = sorted(set(values) - expected)
     missing = sorted(
-        (expected - {"train_sequence_prefix_count"}) - set(values)
+        (
+            expected
+            - {"train_sequence_prefix_count", "train_sequence_offset_count"}
+        )
+        - set(values)
     )
     if unknown or missing:
         raise ValueError(
@@ -212,6 +217,9 @@ def _task(root_path: Path, values: Any, index: int) -> ContinualTaskConfig:
         validation_logical_batches=values["validation_logical_batches"],
         train_sequence_prefix_count=values.get(
             "train_sequence_prefix_count"
+        ),
+        train_sequence_offset_count=values.get(
+            "train_sequence_offset_count", 0
         ),
     )
 

@@ -196,8 +196,10 @@ class ProbeExperimentConfig:
             )
         if not self.run_name:
             raise ValueError("run_name must not be empty")
-        if self.run_kind not in {"smoke", "production"}:
-            raise ValueError("run_kind must be smoke or production")
+        if self.run_kind not in {"smoke", "production", "scaled_budget"}:
+            raise ValueError(
+                "run_kind must be smoke, production, or scaled_budget"
+            )
         source = Path(self.source_checkpoint).expanduser()
         if not source.is_absolute():
             raise ValueError("source_checkpoint must resolve to an absolute path")
@@ -399,12 +401,15 @@ class ProbeExperimentConfig:
                 raise ValueError(
                     "Packed probe validation token cap is too small"
                 )
-        if self.run_kind == "production":
+        if self.run_kind in {"production", "scaled_budget"}:
             if (
                 self.train_source.packed is None
                 or self.validation_source.packed is None
             ):
-                raise ValueError("Production probes require packed sources")
+                raise ValueError(
+                    "Production and scaled-budget probes require packed sources"
+                )
+        if self.run_kind == "production":
             requested_budget = (
                 self.input_token_budget
                 if self.requested_input_token_budget is None

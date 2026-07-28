@@ -11,7 +11,9 @@ exactly two public model names:
   no graph across logical batches.
 
 The language order is always `en → zh_written → fr → ja → es → de → pt → ru`.
-Every repeated appearance uses a distinct packed CulturaX stage. The primary
+The full-budget preset uses a distinct packed CulturaX stage for every repeated
+appearance. The explicitly labelled scaled-budget preset instead uses five
+non-overlapping 1B sequence windows from each frozen cycle-0 5B stage. The primary
 cycle-end Vietnamese probe is `system`: the Transformer reports its ordinary
 curve; FastMem reports carried-memory full-system plasticity while retaining
 the reset curve as a diagnostic.
@@ -127,6 +129,64 @@ Monitor all jobs with:
 ```bash
 tensorboard --logdir /workspace/results/zyphra-fastmem-a100
 ```
+
+## Urgent five-cycle 1B scaled experiment
+
+The H100 presets reuse the eight existing cycle-0 5B training stages without
+copying token files. Each appearance consumes 488,281 complete sequences, or
+999,999,488 input tokens. Five windows consume 2,441,405 of the 2,441,406
+sequences in each source, leaving one sequence unused. The same window is never
+replayed in another cycle.
+
+Forgetting is evaluated after every language boundary on eight fixed held-out
+language-validation stages. These are selected by the existing SHA-256 document
+split and never overlap the training stages. Each contains 1,280 sequences; all
+eight add only 80 MiB of packed uint32 tokens. Transformer forgetting uses
+ordinary validation CE. FastMem forgetting always uses reset memory, making it
+a slow/backbone-retention measurement; carried current-task validation remains
+a separate full-system diagnostic.
+
+Prepare only the missing held-out validation stages and validate all existing
+inputs once:
+
+```bash
+python -m lm_cl.cli.prepare_experiment_data \
+  --config configs/experiments/zyphra_fastmem_h100_5m_5cycle_1b.yaml \
+  --cycles 5 \
+  --parallel-languages 8
+
+python -m lm_cl.cli.launch_experiments \
+  --config configs/experiments/zyphra_fastmem_h100_5m_5cycle_1b.yaml \
+  --dry-run
+
+python -m lm_cl.cli.launch_experiments \
+  --config configs/experiments/zyphra_fastmem_h100_12m_5cycle_1b.yaml \
+  --dry-run
+```
+
+The presets contain three paired seeds. Run the 5M launcher on GPUs 2–4 and the
+12M launcher on GPUs 5–7 in separate terminals. Each GPU executes one job at a
+time; six jobs per model size are queued across three GPUs:
+
+```bash
+python -m lm_cl.cli.launch_experiments \
+  --config configs/experiments/zyphra_fastmem_h100_5m_5cycle_1b.yaml \
+  --gpus 2,3,4 \
+  --jobs-per-gpu 1 \
+  --resume auto
+
+python -m lm_cl.cli.launch_experiments \
+  --config configs/experiments/zyphra_fastmem_h100_12m_5cycle_1b.yaml \
+  --gpus 5,6,7 \
+  --jobs-per-gpu 1 \
+  --resume auto
+```
+
+This is a `scaled_budget` experiment, not an exact 5B-per-appearance Zyphra
+reproduction. Its Vietnamese probes are likewise 1B prefixes of the frozen 5B
+probe-training shard. Full task-boundary forgetting matrices are in each job's
+`metrics.jsonl`; the final per-language and average values are copied to
+`summary.json`.
 
 ## Resume or extend a completed horizon
 

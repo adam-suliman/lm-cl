@@ -78,6 +78,7 @@ class ContinualTaskConfig:
     validation_source: TrainSourceConfig | None
     validation_logical_batches: int
     train_sequence_prefix_count: int | None = None
+    train_sequence_offset_count: int = 0
 
     def validate(
         self,
@@ -113,6 +114,17 @@ class ContinualTaskConfig:
                     "input_token_budget must equal complete-sequence prefix "
                     "times sequence length"
                 )
+        if self.train_sequence_offset_count < 0:
+            raise ValueError(
+                "train_sequence_offset_count must be non-negative"
+            )
+        if (
+            self.train_sequence_offset_count
+            and self.train_sequence_prefix_count is None
+        ):
+            raise ValueError(
+                "A non-zero sequence offset requires an explicit sequence count"
+            )
         self.train_source.validate(allow_pending_packed=allow_pending_packed)
         if self.validation_logical_batches < 0:
             raise ValueError("validation_logical_batches must be non-negative")
@@ -135,15 +147,28 @@ class ContinualTaskConfig:
                 raise ValueError(
                     "Training and validation sequence lengths must match"
                 )
+            if (
+                self.validation_source.packed is not None
+                and self.validation_source.packed.stage.language
+                != self.language
+            ):
+                raise ValueError(
+                    "Validation source language differs from its continual task"
+                )
         if (
             self.train_source.synthetic is not None
             and (
-                self.train_sequence_prefix_count
-                if self.train_sequence_prefix_count is not None
-                else self.planned_logical_batches(
-                    global_sequences_per_logical_batch
+                (
+                    self.train_sequence_offset_count
+                    + self.train_sequence_prefix_count
                 )
-                * global_sequences_per_logical_batch
+                if self.train_sequence_prefix_count is not None
+                else (
+                    self.planned_logical_batches(
+                        global_sequences_per_logical_batch
+                    )
+                    * global_sequences_per_logical_batch
+                )
             )
             > self.train_source.synthetic.num_sequences
         ):
@@ -152,23 +177,36 @@ class ContinualTaskConfig:
             )
         if self.train_source.packed is not None:
             stage = self.train_source.packed.stage
-            if (
+            if self.train_sequence_offset_count == 0:
+                if (
+                    stage.language != self.language
+                    or stage.task_index != self.task_index
+                    or stage.cycle_index != self.cycle_index
+                ):
+                    raise ValueError(
+                        "Packed stage language/task/cycle differs from task"
+                    )
+            elif (
                 stage.language != self.language
-                or stage.task_index != self.task_index
-                or stage.cycle_index != self.cycle_index
+                or stage.task_index
+                != CONTINUAL_LANGUAGE_ORDER.index(self.language)
+                or stage.cycle_index != 0
             ):
                 raise ValueError(
-                    "Packed stage language/task/cycle differs from task"
+                    "Windowed reuse requires the matching cycle-0 language stage"
                 )
             identity = self.train_source.packed.packed_manifest_identity
             if (
                 identity is not None
                 and self.train_sequence_prefix_count is not None
                 and identity.expected_complete_sequence_count
-                < self.train_sequence_prefix_count
+                < (
+                    self.train_sequence_offset_count
+                    + self.train_sequence_prefix_count
+                )
             ):
                 raise ValueError(
-                    "Packed stage has fewer complete sequences than the task prefix"
+                    "Packed stage has fewer complete sequences than the task window"
                 )
 
     def planned_logical_batches(
@@ -400,4 +438,11 @@ class ContinualExperimentConfig:
                     )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        # Preserve schema-v1 checkpoint identities for legacy tasks.  The
+        # offset was added for windowed packed views; zero has exactly the old
+        # semantics and therefore must not perturb historical config hashes.
+        for task in values["tasks"]:
+            if task.get("train_sequence_offset_count", 0) == 0:
+                task.pop("train_sequence_offset_count", None)
+        return values

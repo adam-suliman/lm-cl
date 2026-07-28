@@ -442,6 +442,66 @@ def _summary(
             )
         )
         probe_rows.append(row)
+    latest_forgetting = state.get("forgetting_latest_mean_loss", {})
+    first_forgetting = state.get("forgetting_first_mean_loss", {})
+    best_forgetting = state.get("forgetting_best_mean_loss", {})
+    forgetting_rows = {
+        language: {
+            "mean_validation_ce": float(value),
+            "first_post_task_mean_validation_ce": float(
+                first_forgetting[language]
+            ),
+            "best_so_far_mean_validation_ce": float(
+                best_forgetting[language]
+            ),
+            "ce_change_from_first": float(value)
+            - float(first_forgetting[language]),
+            "forgetting_from_best_ce": float(value)
+            - float(best_forgetting[language]),
+        }
+        for language, value in latest_forgetting.items()
+    }
+    final_forgetting = None
+    if forgetting_rows:
+        prior_rows = [
+            row
+            for language, row in forgetting_rows.items()
+            if language != state.get("language")
+        ]
+        final_forgetting = {
+            "metric": "mean_validation_ce_from_best_v1",
+            "memory_evaluation_mode": (
+                "reset"
+                if spec.internal_variant == "fastmem_rmt"
+                else "not_applicable"
+            ),
+            "evaluation_count": state.get(
+                "forgetting_evaluation_count", 0
+            ),
+            "languages": forgetting_rows,
+            "average_ce_change_from_first": sum(
+                row["ce_change_from_first"]
+                for row in forgetting_rows.values()
+            )
+            / len(forgetting_rows),
+            "average_forgetting_from_best_ce": sum(
+                row["forgetting_from_best_ce"]
+                for row in forgetting_rows.values()
+            )
+            / len(forgetting_rows),
+            "prior_language_count": len(prior_rows),
+            "average_prior_language_forgetting_from_best_ce": (
+                None
+                if not prior_rows
+                else sum(
+                    row["forgetting_from_best_ce"] for row in prior_rows
+                )
+                / len(prior_rows)
+            ),
+            "full_matrix_source": str(
+                Path(spec.output_dir) / "metrics.jsonl"
+            ),
+        }
     return {
         "summary_schema_version": 1,
         "status": "complete",
@@ -464,6 +524,7 @@ def _summary(
         "final_validation_losses": [
             item["final_validation_ce"] for item in probe_rows
         ],
+        "final_forgetting": final_forgetting,
         "failure_history": metadata["failure_history"],
         "resume_history": metadata["resume_history"],
         "environment_identity": inspect_environment(),

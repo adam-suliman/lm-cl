@@ -6,6 +6,7 @@ from lm_cl.metrics.probe import (
     percent_change_from_first,
     trapezoidal_auc,
 )
+from lm_cl.metrics.forgetting import update_forgetting_metrics
 
 __all__ = [
     "JsonlMetricLogger",
@@ -14,4 +15,5 @@ __all__ = [
     "compute_probe_auc_report",
     "percent_change_from_first",
     "trapezoidal_auc",
+    "update_forgetting_metrics",
 ]
