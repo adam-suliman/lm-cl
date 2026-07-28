@@ -147,12 +147,16 @@ def _parallel_audit_is_current(
         item["path"]: item["manifest_file_sha256"]
         for item in audit.get("manifests", [])
     }
+    global_identity = audit.get("global_registry", {})
+    current_stat = global_registry.stat()
     return (
         audit.get("status") == "complete"
         and audit.get("cross_lane_conflicts") == []
         and actual == expected
-        and audit.get("global_registry", {}).get("sha256")
-        == sha256_file(global_registry)
+        and isinstance(global_identity.get("sha256"), str)
+        and len(global_identity["sha256"]) == 64
+        and global_identity.get("size_bytes") == current_stat.st_size
+        and global_identity.get("mtime_ns") == current_stat.st_mtime_ns
     )
 
 
@@ -391,6 +395,48 @@ def _merge_parallel_overlap_registries(
     finally:
         os.close(directory_fd)
 
+    def hash_lane_registry(
+        language: str, path: Path
+    ) -> dict[str, Any]:
+        before = path.stat()
+        digest = sha256_file(path)
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise RuntimeError(f"Lane registry changed while hashing: {path}")
+        return {
+            "language": language,
+            "path": str(path),
+            "size_bytes": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+            "sha256": digest,
+        }
+
+    with ThreadPoolExecutor(
+        max_workers=min(len(lane_paths), os.cpu_count() or 1),
+        thread_name_prefix="registry-hash",
+    ) as executor:
+        lane_registries = sorted(
+            (future.result() for future in as_completed([
+                executor.submit(hash_lane_registry, language, path)
+                for language, path in lane_paths.items()
+            ])),
+            key=lambda item: item["language"],
+        )
+    global_before_hash = global_registry.stat()
+    global_sha256 = sha256_file(global_registry)
+    global_after_hash = global_registry.stat()
+    if (
+        global_before_hash.st_size,
+        global_before_hash.st_mtime_ns,
+    ) != (
+        global_after_hash.st_size,
+        global_after_hash.st_mtime_ns,
+    ):
+        raise RuntimeError("Global registry changed while hashing")
+
     audit = {
         "schema_version": 1,
         "status": "complete",
@@ -399,20 +445,14 @@ def _merge_parallel_overlap_registries(
         "included_stage_ids": expected_stage_ids,
         "cross_lane_conflicts": [],
         "manifests": sorted(records, key=lambda item: item["path"]),
-        "lane_registries": [
-            {
-                "language": language,
-                "path": str(path),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-            for language, path in lane_paths.items()
-        ],
+        "lane_registries": lane_registries,
         "global_registry": {
             "path": str(global_registry),
-            "size_bytes": global_registry.stat().st_size,
-            "sha256": sha256_file(global_registry),
+            "size_bytes": global_after_hash.st_size,
+            "mtime_ns": global_after_hash.st_mtime_ns,
+            "sha256": global_sha256,
             "document_count": merged_count,
+            "current_check": "recorded_sha256_plus_size_and_mtime_v2",
             "pre_merge_backup": None if backup is None else str(backup),
         },
     }
