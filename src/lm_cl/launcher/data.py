@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -198,10 +199,78 @@ def _merge_parallel_overlap_registries(
         _checkpoint_sqlite(path)
     _checkpoint_sqlite(global_registry)
 
+    def count_lane_stages(
+        language: str, lane_path: Path
+    ) -> tuple[str, dict[str, int]]:
+        lane_records = [
+            item for item in records if item["language"] == language
+        ]
+        count_expressions = ", ".join(
+            "COALESCE(SUM(CASE WHEN stage_id=? THEN 1 ELSE 0 END), 0)"
+            for _ in lane_records
+        )
+        uri = f"file:{lane_path}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            mmap_mib = int(
+                os.environ.get("LM_CL_REGISTRY_MMAP_MIB", "4096")
+            )
+            connection.execute(f"PRAGMA mmap_size={mmap_mib * 1024 * 1024}")
+            counts = connection.execute(
+                f"SELECT {count_expressions} FROM documents",
+                [item["stage_id"] for item in lane_records],
+            ).fetchone()
+        finally:
+            connection.close()
+        assert counts is not None
+        return language, {
+            record["stage_id"]: int(count)
+            for record, count in zip(lane_records, counts, strict=True)
+        }
+
+    print(
+        json.dumps(
+            {
+                "event": "parallel_registry_merge_started",
+                "expected_document_count": sum(
+                    item["accepted_document_count"] for item in records
+                ),
+                "language_count": len(languages),
+                "method": "expected_stages_counted_fast_global_merge_v2",
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    with ThreadPoolExecutor(
+        max_workers=min(len(lane_paths), os.cpu_count() or 1),
+        thread_name_prefix="registry-count",
+    ) as executor:
+        lane_stage_counts = dict(
+            future.result()
+            for future in as_completed(
+                [
+                    executor.submit(count_lane_stages, language, path)
+                    for language, path in lane_paths.items()
+                ]
+            )
+        )
+    for record in records:
+        count = lane_stage_counts[record["language"]][record["stage_id"]]
+        if count != record["accepted_document_count"]:
+            raise ValueError(
+                "Lane registry count mismatch for stage "
+                f"{record['stage_id']}: {count} != "
+                f"{record['accepted_document_count']}"
+            )
+
     temporary = lane_root / f"global-merge-{os.getpid()}.sqlite3"
     if temporary.exists():
         raise FileExistsError(f"Refusing stale merge target: {temporary}")
     conflict: dict[str, Any] | None = None
+    merge_started = time.monotonic()
     with OverlapRegistry(temporary) as merged:
         connection = merged.connection
         # The merge target is a disposable, fully reproducible rebuild.  WAL
@@ -225,22 +294,6 @@ def _merge_parallel_overlap_registries(
             lane_records = [
                 item for item in records if item["language"] == language
             ]
-            count_expressions = ", ".join(
-                "COALESCE(SUM(CASE WHEN stage_id=? THEN 1 ELSE 0 END), 0)"
-                for _ in lane_records
-            )
-            lane_counts = connection.execute(
-                f"SELECT {count_expressions} FROM {alias}.documents",
-                [item["stage_id"] for item in lane_records],
-            ).fetchone()
-            assert lane_counts is not None
-            for record, count in zip(lane_records, lane_counts, strict=True):
-                if int(count) != record["accepted_document_count"]:
-                    raise ValueError(
-                        "Lane registry count mismatch for stage "
-                        f"{record['stage_id']}: {count} != "
-                        f"{record['accepted_document_count']}"
-                    )
             before_changes = connection.total_changes
             connection.execute(
                 f"INSERT OR IGNORE INTO documents "
@@ -288,6 +341,21 @@ def _merge_parallel_overlap_registries(
                 connection.execute(f"DETACH DATABASE {alias}")
                 break
             connection.execute(f"DETACH DATABASE {alias}")
+            print(
+                json.dumps(
+                    {
+                        "elapsed_seconds": time.monotonic() - merge_started,
+                        "event": "parallel_registry_lane_merged",
+                        "expected_document_count": expected_inserted,
+                        "language": language,
+                        "lane_index": lane_index + 1,
+                        "lane_total": len(lane_paths),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         if conflict is not None:
             raise ValueError(
                 "Cross-lane overlap prevents deterministic global merge: "
