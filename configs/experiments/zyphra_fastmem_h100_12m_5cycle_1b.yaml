@@ -61,10 +61,10 @@ fastmem:
   slow_accumulation_k: 2
 
 launcher:
-  gpu_ids: [5, 6, 7]
+  gpu_ids: [4, 5, 6, 7]
   jobs_per_gpu: 1
   gpus_per_job: 1
-  max_parallel_jobs: 3
+  max_parallel_jobs: 4
   start_method: subprocess
   fail_fast: true
   retry_count: 1

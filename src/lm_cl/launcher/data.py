@@ -171,6 +171,19 @@ def _merge_parallel_overlap_registries(
         return json.loads(audit_path.read_text(encoding="utf-8"))
 
     languages = sorted({item["language"] for item in records})
+    stage_ids_by_language = {
+        language: sorted(
+            {
+                item["stage_id"]
+                for item in records
+                if item["language"] == language
+            }
+        )
+        for language in languages
+    }
+    expected_stage_ids = sorted(
+        {item["stage_id"] for item in records}
+    )
     lane_paths = {
         language: _lane_registry_path(generated_root, language)
         for language in languages
@@ -191,67 +204,108 @@ def _merge_parallel_overlap_registries(
     conflict: dict[str, Any] | None = None
     with OverlapRegistry(temporary) as merged:
         connection = merged.connection
-        if global_registry.is_file():
-            connection.execute("ATTACH DATABASE ? AS baseline", (str(global_registry),))
-            connection.execute(
-                "INSERT INTO documents SELECT * FROM baseline.documents"
-            )
-            connection.commit()
-            connection.execute("DETACH DATABASE baseline")
+        # The merge target is a disposable, fully reproducible rebuild.  WAL
+        # plus synchronous=FULL turns this bulk copy into many gigabytes of
+        # redundant shared-filesystem writes.  Build without a rollback
+        # journal, then fsync the completed database before atomic replacement.
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        journal_mode = connection.execute(
+            "PRAGMA journal_mode=OFF"
+        ).fetchone()
+        if journal_mode is None or str(journal_mode[0]).lower() != "off":
+            raise RuntimeError("Could not disable the temporary merge journal")
+        connection.execute("PRAGMA synchronous=OFF")
         for lane_index, (language, lane_path) in enumerate(lane_paths.items()):
             alias = f"lane_{lane_index}"
+            lane_stage_ids = stage_ids_by_language[language]
+            placeholders = ",".join("?" for _ in lane_stage_ids)
             connection.execute(
                 f"ATTACH DATABASE ? AS {alias}", (str(lane_path),)
             )
-            content_row = connection.execute(
-                f"""
-                SELECT lane.content_sha256, lane.stage_id, main.stage_id
-                FROM {alias}.documents AS lane
-                JOIN documents AS main
-                  ON main.content_sha256=lane.content_sha256
-                WHERE {_rows_differ_clause('lane', 'main')}
-                LIMIT 1
-                """
+            lane_records = [
+                item for item in records if item["language"] == language
+            ]
+            count_expressions = ", ".join(
+                "COALESCE(SUM(CASE WHEN stage_id=? THEN 1 ELSE 0 END), 0)"
+                for _ in lane_records
+            )
+            lane_counts = connection.execute(
+                f"SELECT {count_expressions} FROM {alias}.documents",
+                [item["stage_id"] for item in lane_records],
             ).fetchone()
-            token_row = connection.execute(
-                f"""
-                SELECT lane.token_ids_sha256, lane.stage_id, main.stage_id
-                FROM {alias}.documents AS lane
-                JOIN documents AS main
-                  ON main.token_ids_sha256=lane.token_ids_sha256
-                WHERE {_rows_differ_clause('lane', 'main')}
-                LIMIT 1
-                """
-            ).fetchone()
-            if content_row is not None or token_row is not None:
+            assert lane_counts is not None
+            for record, count in zip(lane_records, lane_counts, strict=True):
+                if int(count) != record["accepted_document_count"]:
+                    raise ValueError(
+                        "Lane registry count mismatch for stage "
+                        f"{record['stage_id']}: {count} != "
+                        f"{record['accepted_document_count']}"
+                    )
+            before_changes = connection.total_changes
+            connection.execute(
+                f"INSERT OR IGNORE INTO documents "
+                f"SELECT * FROM {alias}.documents "
+                f"WHERE stage_id IN ({placeholders})",
+                lane_stage_ids,
+            )
+            connection.commit()
+            inserted = connection.total_changes - before_changes
+            expected_inserted = sum(
+                item["accepted_document_count"] for item in lane_records
+            )
+            if inserted != expected_inserted:
+                content_row = connection.execute(
+                    f"""
+                    SELECT lane.content_sha256, lane.stage_id, main.stage_id
+                    FROM {alias}.documents AS lane
+                    JOIN documents AS main
+                      ON main.content_sha256=lane.content_sha256
+                    WHERE lane.stage_id IN ({placeholders})
+                      AND ({_rows_differ_clause('lane', 'main')})
+                    LIMIT 1
+                    """,
+                    lane_stage_ids,
+                ).fetchone()
+                token_row = connection.execute(
+                    f"""
+                    SELECT lane.token_ids_sha256, lane.stage_id, main.stage_id
+                    FROM {alias}.documents AS lane
+                    JOIN documents AS main
+                      ON main.token_ids_sha256=lane.token_ids_sha256
+                    WHERE lane.stage_id IN ({placeholders})
+                      AND ({_rows_differ_clause('lane', 'main')})
+                    LIMIT 1
+                    """,
+                    lane_stage_ids,
+                ).fetchone()
                 conflict = {
                     "language": language,
                     "content_conflict": content_row,
                     "token_conflict": token_row,
+                    "inserted": inserted,
+                    "expected_inserted": expected_inserted,
                 }
                 connection.execute(f"DETACH DATABASE {alias}")
                 break
-            connection.execute(
-                f"INSERT OR IGNORE INTO documents SELECT * FROM {alias}.documents"
-            )
-            connection.commit()
             connection.execute(f"DETACH DATABASE {alias}")
         if conflict is not None:
             raise ValueError(
                 "Cross-lane overlap prevents deterministic global merge: "
                 f"{conflict}"
             )
-        for record in records:
-            count = merged.count_for_stage(record["stage_id"])
-            if count != record["accepted_document_count"]:
-                raise ValueError(
-                    "Merged registry count mismatch for stage "
-                    f"{record['stage_id']}: {count} != "
-                    f"{record['accepted_document_count']}"
-                )
         merged.commit()
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         merged_count = merged.count()
+        expected_merged_count = sum(
+            item["accepted_document_count"] for item in records
+        )
+        if merged_count != expected_merged_count:
+            raise ValueError(
+                "Merged registry count mismatch: "
+                f"{merged_count} != {expected_merged_count}"
+            )
+
+    with temporary.open("rb") as handle:
+        os.fsync(handle.fileno())
 
     backup = None
     if global_registry.is_file():
@@ -273,7 +327,8 @@ def _merge_parallel_overlap_registries(
         "schema_version": 1,
         "status": "complete",
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-        "method": "parallel_language_lanes_then_checked_global_merge_v1",
+        "method": "expected_stages_counted_fast_global_merge_v2",
+        "included_stage_ids": expected_stage_ids,
         "cross_lane_conflicts": [],
         "manifests": sorted(records, key=lambda item: item["path"]),
         "lane_registries": [

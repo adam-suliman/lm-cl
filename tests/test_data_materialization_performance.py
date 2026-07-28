@@ -626,6 +626,15 @@ def test_parallel_lane_merge_preserves_identical_baseline_and_audits(
     global_registry = generated / "overlap.sqlite3"
     insert(en_lane, content="a" * 64, token="b" * 64, stage="en-stage", language="en")
     insert(fr_lane, content="c" * 64, token="d" * 64, stage="fr-stage", language="fr")
+    # A lane may also contain an interrupted or superseded stage.  It is not
+    # part of this resolved experiment and must not inflate the global merge.
+    insert(
+        en_lane,
+        content="e" * 64,
+        token="f" * 64,
+        stage="superseded-en-stage",
+        language="en",
+    )
     insert(
         global_registry,
         content="a" * 64,
@@ -661,7 +670,10 @@ def test_parallel_lane_merge_preserves_identical_baseline_and_audits(
     audit = _merge_parallel_overlap_registries(config, manifests)
     assert audit is not None
     assert audit["status"] == "complete"
+    assert audit["method"] == "expected_stages_counted_fast_global_merge_v2"
+    assert audit["included_stage_ids"] == ["en-stage", "fr-stage"]
     assert audit["cross_lane_conflicts"] == []
     assert audit["global_registry"]["document_count"] == 2
     with OverlapRegistry(global_registry) as registry:
         assert registry.count() == 2
+        assert registry.count_for_stage("superseded-en-stage") == 0
