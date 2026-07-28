@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import types
 from dataclasses import replace
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import lm_cl.data.huggingface as huggingface_data
+import lm_cl.data.packed as packed_data
 from lm_cl.config import (
     DataPipelineConfig,
     DatasetReference,
@@ -25,7 +27,7 @@ from lm_cl.data.materialize import (
     _config_fingerprint,
     materialize_stage,
 )
-from lm_cl.data.packed import validate_packed_shards
+from lm_cl.data.packed import PackedShardSource, validate_packed_shards
 from lm_cl.data.registry import OverlapRegistry
 from lm_cl.data.storage import PeriodicDiskLimitGuard, ensure_owned_root
 from lm_cl.launcher.data import _merge_parallel_overlap_registries
@@ -247,6 +249,38 @@ def test_ordered_batching_preserves_packed_identity(tmp_path, monkeypatch):
     validate_packed_shards(
         Path(batch_config.storage.generated_root) / "stages/ordered-stage"
     )
+
+
+def test_packed_source_reuses_full_validation_until_a_file_changes(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path, generated_name="validation-cache")
+    _run(config, BatchTokenizer())
+    stage = Path(config.storage.generated_root) / "stages/ordered-stage"
+    (stage / packed_data.PACKED_VALIDATION_CACHE_FILENAME).unlink()
+    calls = 0
+    original = packed_data.validate_packed_shards
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(packed_data, "validate_packed_shards", counted)
+    first = PackedShardSource(stage)
+    second = PackedShardSource(stage)
+    assert first.token_count == second.token_count == 512
+    assert calls == 1
+
+    shard = stage / first.manifest["shards"][0]["filename"]
+    stat = shard.stat()
+    os.utime(
+        shard,
+        ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
+    )
+    third = PackedShardSource(stage)
+    assert third.token_count == 512
+    assert calls == 2
 
 
 def test_progress_reports_checkpoint_throughput(tmp_path, monkeypatch):

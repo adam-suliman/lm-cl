@@ -559,7 +559,9 @@ class DistributedContinualTrainer(ContinualTrainer):
             "throughput_input_tokens_per_second": (
                 global_input_tokens / elapsed
             ),
-            "parameter_norm": tensor_norm(self.model.parameters()),
+            "parameter_norm": self._diagnostic_parameter_norm(
+                self.state.global_logical_batches
+            ),
             "gradient_norm": None,
             "learning_rate": (
                 None if self.scheduler is None else self.scheduler.current_lr
@@ -584,21 +586,6 @@ class DistributedContinualTrainer(ContinualTrainer):
         assert self.optimizer is not None and self.scheduler is not None
         if self.scaler.is_enabled():
             self.scaler.unscale_(self.optimizer)
-        local_nonfinite = int(
-            any(
-                parameter.grad is not None
-                and not bool(torch.isfinite(parameter.grad).all())
-                for parameter in self.model.parameters()
-            )
-        )
-        if all_reduce_int(
-            local_nonfinite,
-            self.distributed,
-            op=dist.ReduceOp.MAX,
-        ):
-            raise FloatingPointError(
-                "A rank produced a non-finite slow gradient"
-            )
         gradient_norm = self._normalized_gradient_norm()
         learning_rate = self.scheduler.current_lr
         if self.scaler.is_enabled():
@@ -617,7 +604,9 @@ class DistributedContinualTrainer(ContinualTrainer):
             ),
             "learning_rate": learning_rate,
             "gradient_norm": gradient_norm,
-            "parameter_norm": tensor_norm(self.model.parameters()),
+            "parameter_norm": self._diagnostic_parameter_norm(
+                self.state.global_slow_steps
+            ),
             "window_logical_batches": self.state.window_logical_batches,
             "tail_flush": tail_flush,
         }

@@ -429,4 +429,7 @@ class ProbeExperimentConfig:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        if values["runtime"].get("diagnostic_norm_interval_steps") == 1:
+            values["runtime"].pop("diagnostic_norm_interval_steps", None)
+        return values

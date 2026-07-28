@@ -190,6 +190,30 @@ probe-training shard. Full task-boundary forgetting matrices are in each job's
 `metrics.jsonl`; the final per-language and average values are copied to
 `summary.json`.
 
+For a deadline-limited two-cycle run, use the dedicated H100 presets. They
+retain the frozen 5B source-stage identity while consuming only its first two
+non-overlapping 1B windows; changing `--cycles` on the five-cycle preset is not
+equivalent. The default eight-GPU layout runs the paired Transformer and
+FastMem jobs concurrently on four GPUs each:
+
+```bash
+python -m lm_cl.cli.launch_experiments \
+  --config configs/experiments/zyphra_fastmem_h100_5m_2cycle_1b_8gpu.yaml \
+  --models transformer,fastmem_rmt \
+  --seeds 81010 \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --gpus-per-job 4 \
+  --jobs-per-gpu 1 \
+  --resume auto \
+  --manifest-only-preflight
+```
+
+Run the corresponding 12M preset only after the first paired seed completes,
+unless a measured benchmark shows enough deadline margin. Giving all eight
+GPUs to one job is available with `--gpus-per-job 8`, but a baseline/FastMem
+pair then runs sequentially; because DDP scaling is sublinear, this normally
+has a longer paired-result makespan than the four-plus-four layout.
+
 ## Resume or extend a completed horizon
 
 `resume: auto` validates `latest_checkpoint.json` and resumes interruption

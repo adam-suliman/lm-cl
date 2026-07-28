@@ -31,14 +31,20 @@ class JsonlMetricLogger:
                 flush_seconds=tensorboard_flush_seconds,
             )
         )
+        self._handle = self.path.open(
+            "a",
+            encoding="utf-8",
+            buffering=1,
+        )
 
     def log(self, metrics: dict[str, Any]) -> None:
         if self.closed:
             raise RuntimeError("Metric logger is closed")
         record = _json_safe(metrics)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
-            handle.flush()
+        self._handle.write(
+            json.dumps(record, sort_keys=True, allow_nan=False) + "\n"
+        )
+        self._handle.flush()
         if self.tensorboard is not None:
             log_record_to_tensorboard(
                 self.tensorboard,
@@ -49,6 +55,7 @@ class JsonlMetricLogger:
     def close(self) -> None:
         if self.closed:
             return
+        self._handle.close()
         if self.tensorboard is not None:
             self.tensorboard.close()
         self.closed = True

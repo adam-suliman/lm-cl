@@ -316,6 +316,9 @@ class RMTZyphraTransformer(ZyphraTransformer):
         super().__init__(config)
         self.memory_token_count = memory_tokens
         self.segment_length = segment_length
+        self._attention_mask_cache: dict[
+            tuple[int, str, int | None, torch.dtype], torch.Tensor
+        ] = {}
         self.initial_memory = nn.Parameter(
             torch.empty(memory_tokens, config.hidden_size)
         )
@@ -357,13 +360,39 @@ class RMTZyphraTransformer(ZyphraTransformer):
         # Read memory can read only incoming read memory.
         mask[:text_start, :text_start] = 0
         # Text can read incoming memory and causal current-segment text.
-        for row in range(text_tokens):
-            query = text_start + row
-            mask[query, :text_start] = 0
-            mask[query, text_start : query + 1] = 0
+        mask[text_start:write_start, :text_start] = 0
+        text_mask = mask[
+            text_start:write_start,
+            text_start:write_start,
+        ]
+        text_mask.copy_(torch.triu(text_mask, diagonal=1))
         # Write rows are diagnostic/next-segment state and can summarize all
         # incoming read memory, current text, and write positions.
         mask[write_start:, :] = 0
+        return mask
+
+    def _attention_mask(
+        self,
+        text_tokens: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (
+            text_tokens,
+            device.type,
+            device.index,
+            dtype,
+        )
+        mask = self._attention_mask_cache.get(key)
+        if mask is None:
+            mask = self.build_attention_mask(
+                self.memory_token_count,
+                text_tokens,
+                device=device,
+                dtype=dtype,
+            )
+            self._attention_mask_cache[key] = mask
         return mask
 
     def _expand_memory(
@@ -409,8 +438,7 @@ class RMTZyphraTransformer(ZyphraTransformer):
             position_offset=position_offset,
         )
         hidden = torch.cat((read, text, write), dim=1)
-        mask = self.build_attention_mask(
-            self.memory_token_count,
+        mask = self._attention_mask(
             text_tokens,
             device=hidden.device,
             dtype=hidden.dtype,

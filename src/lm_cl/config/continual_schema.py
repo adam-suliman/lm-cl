@@ -283,6 +283,7 @@ class ContinualRuntimeConfig:
     tensorboard_dir: str | None = None
     tensorboard_flush_seconds: int = 30
     tensorboard_log_every_batches: int = 1
+    diagnostic_norm_interval_steps: int = 1
 
     def validate(self) -> None:
         if self.device not in {"cpu", "cuda", "auto"}:
@@ -298,6 +299,10 @@ class ContinualRuntimeConfig:
         if self.tensorboard_log_every_batches <= 0:
             raise ValueError(
                 "runtime.tensorboard_log_every_batches must be positive"
+            )
+        if self.diagnostic_norm_interval_steps <= 0:
+            raise ValueError(
+                "runtime.diagnostic_norm_interval_steps must be positive"
             )
 
 
@@ -439,6 +444,8 @@ class ContinualExperimentConfig:
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
+        if values["runtime"].get("diagnostic_norm_interval_steps") == 1:
+            values["runtime"].pop("diagnostic_norm_interval_steps", None)
         # Preserve schema-v1 checkpoint identities for legacy tasks.  The
         # offset was added for windowed packed views; zero has exactly the old
         # semantics and therefore must not perturb historical config hashes.

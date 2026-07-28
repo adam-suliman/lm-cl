@@ -72,12 +72,13 @@ launcher:
   disk_free_floor_bytes: 21474836480
   checkpoint_bytes_per_parameter: 20
   checkpoint_fixed_overhead_bytes: 67108864
+  ddp_debug_assert_synced: false
 
 tracking:
   jsonl: true
   tensorboard: true
   tensorboard_flush_seconds: 30
-  log_every_batches: 10
+  log_every_batches: 100
   save_summary_csv: true
   save_summary_json: true
 

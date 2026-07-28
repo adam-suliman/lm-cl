@@ -23,6 +23,9 @@ They create no additional continual-training token files. Only eight fixed
 1,280-sequence held-out language-validation stages are added (80 MiB of packed
 uint32 tokens total), plus manifests and boundary metadata. The Vietnamese
 probe reuses a 1B prefix of the existing frozen 5B probe-training stage.
+The deadline-oriented two-cycle presets explicitly keep the same 5B frozen
+source budget while exposing only the first two 1B windows. This source budget
+is configuration, not an inferred consequence of the requested horizon.
 
 The preparation CLI normally runs one isolated materialization subprocess per
 missing stage. With `--parallel-languages N`, it instead runs up to `N`
@@ -130,6 +133,15 @@ are replayed into that lane before new documents are accepted.
 Use `--manifest-only` or `--manifest-only-preflight` only after a full shard
 checksum validation has been recorded for those immutable files. These modes
 validate manifest identities but deliberately avoid rereading every token bin.
+
+A successful full packed validation now writes a compact, lock-protected
+validation cache beside the stage manifest. The cache does not replace the
+manifest hashes and does not enter scientific identity. Another process may
+reuse it only when the manifest identity and every manifest/shard/boundary
+file's device, inode, size, modification time, and change time are unchanged.
+Any mismatch, missing cache, malformed cache, or tokenizer expectation change
+forces the complete checksum, token-ID, and boundary audit again. Concurrent
+ranks serialize the first audit so they do not all reread the same stage.
 
 ## Resume pointer
 

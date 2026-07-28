@@ -23,7 +23,7 @@ from lm_cl.data.packed import (
     PackedShardWriter,
     manifest_content_hash,
     ordered_data_hash,
-    validate_packed_shards,
+    validate_packed_shards_cached,
 )
 from lm_cl.data.registry import OverlapRegistry
 from lm_cl.data.selection import select_documents
@@ -482,7 +482,7 @@ def _load_or_initialize(
             raise FileExistsError(
                 f"Complete stage exists; refusing overwrite: {stage_dir}"
             )
-        validate_packed_shards(complete_path)
+        validate_packed_shards_cached(complete_path)
         complete = json.loads(complete_path.read_text(encoding="utf-8"))
         if complete.get("config_fingerprint") != _config_fingerprint(
             config, tokenizer_manifest
@@ -705,7 +705,7 @@ def _materialize_stage(
             raise FileExistsError(
                 f"Complete stage exists; refusing overwrite: {stage_dir}"
             )
-        validate_packed_shards(complete_path)
+        validate_packed_shards_cached(complete_path)
         complete = json.loads(complete_path.read_text(encoding="utf-8"))
         if complete.get("config_fingerprint") != _config_fingerprint(
             config, tokenizer_manifest
@@ -1201,7 +1201,7 @@ def _materialize_stage(
                 state["manifest_content_sha256"] = manifest_content_hash(state)
                 complete_path = stage_dir / "manifest.json"
                 atomic_write_json(complete_path, state)
-                validate_packed_shards(complete_path)
+                validate_packed_shards_cached(complete_path)
                 if remove_boundary_after_complete:
                     boundary_path.unlink(missing_ok=True)
                 incomplete_path.unlink()

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from lm_cl.launcher.config import load_launcher_config
 from lm_cl.launcher.data import resolve_data_contract
@@ -40,7 +41,13 @@ from lm_cl.launcher.state import (
 )
 from lm_cl.metrics import JsonlMetricLogger, TensorBoardTracker
 from lm_cl.metrics import update_forgetting_metrics
-from lm_cl.config import DataConfig, TokenizerReference, TrainSourceConfig
+from lm_cl.config import (
+    DataConfig,
+    TokenizerReference,
+    TrainSourceConfig,
+    load_model_config,
+)
+from lm_cl.models import RMTZyphraTransformer
 from lm_cl.training import ContinualTrainer, ProbeTrainer
 from lm_cl.training import continual as continual_training
 from lm_cl.training.checkpoint import load_checkpoint, sha256_file
@@ -122,6 +129,8 @@ def test_inactive_new_launcher_fields_preserve_legacy_serialization(tmp_path):
     serialized = config.to_dict()
     assert "forgetting" not in serialized
     assert "language_validation_manifest_template" not in serialized["data"]
+    assert "window_source_tokens_per_task" not in serialized["data"]
+    assert "ddp_debug_assert_synced" not in serialized["launcher"]
 
 
 def test_zero_sequence_offsets_preserve_legacy_continual_serialization(tmp_path):
@@ -138,6 +147,52 @@ def test_zero_sequence_offsets_preserve_legacy_continual_serialization(tmp_path)
         "train_sequence_offset_count" not in task
         for task in continual.to_dict()["tasks"]
     )
+    assert "diagnostic_norm_interval_steps" not in continual.to_dict()[
+        "runtime"
+    ]
+
+
+def test_h100_configs_disable_per_step_ddp_digests(monkeypatch, tmp_path):
+    monkeypatch.setenv("LM_CL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("LM_CL_OUTPUT_ROOT", str(tmp_path / "output"))
+    for name in (
+        "zyphra_fastmem_h100_5m_5cycle_1b.yaml",
+        "zyphra_fastmem_h100_12m_5cycle_1b.yaml",
+    ):
+        config = load_launcher_config(ROOT / "configs/experiments" / name)
+        assert config.launcher.ddp_debug_assert_synced is False
+        assert config.tracking.log_every_batches == 100
+
+
+def test_rmt_attention_mask_is_vectorized_and_cached():
+    config = load_model_config(ROOT / "configs/models/tiny_test.yaml")
+    model = RMTZyphraTransformer(
+        config,
+        memory_tokens=2,
+        segment_length=4,
+    )
+    mask = model._attention_mask(
+        4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    again = model._attention_mask(
+        4,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert mask.data_ptr() == again.data_ptr()
+    assert tuple(mask.shape) == (8, 8)
+    assert torch.equal(mask[:2, :2], torch.zeros(2, 2))
+    assert bool(torch.isneginf(mask[:2, 2:]).all())
+    assert torch.equal(mask[2:6, :2], torch.zeros(4, 2))
+    expected_causal = torch.triu(
+        torch.full((4, 4), float("-inf")),
+        diagonal=1,
+    )
+    assert torch.equal(mask[2:6, 2:6], expected_causal)
+    assert bool(torch.isneginf(mask[2:6, 6:]).all())
+    assert torch.equal(mask[6:, :], torch.zeros(2, 8))
 
 
 def test_one_job_contains_every_task_and_cycle(tmp_path):
@@ -174,6 +229,27 @@ def test_five_one_billion_windows_exactly_fit_one_five_billion_source():
         for (left_start, left_count), (right_start, _) in zip(
             windows, windows[1:]
         )
+    )
+
+
+def test_two_cycle_config_can_reuse_a_frozen_five_billion_source(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LM_CL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("LM_CL_OUTPUT_ROOT", str(tmp_path / "output"))
+    config = load_launcher_config(
+        ROOT
+        / "configs/experiments/zyphra_fastmem_h100_5m_2cycle_1b_8gpu.yaml"
+    )
+    task = resolve_token_budget(config.experiment.tokens_per_task, 2048)
+    source = resolve_token_budget(
+        config.data.window_source_tokens_per_task,
+        2048,
+    )
+    assert config.experiment.cycles == 2
+    assert launcher_data._source_task_budget(config) == source
+    assert source.effective_complete_sequences >= (
+        2 * task.effective_complete_sequences
     )
 
 

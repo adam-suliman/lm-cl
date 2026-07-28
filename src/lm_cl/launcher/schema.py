@@ -172,6 +172,7 @@ class DataSettings:
     split_seed: int = 41_001
     validation_permyriad: int = 100
     max_shard_tokens: int = 250_000_000
+    window_source_tokens_per_task: int | None = None
 
     def validate(self, experiment: ExperimentSettings) -> None:
         if self.mode not in {"packed", "synthetic"}:
@@ -246,6 +247,45 @@ class DataSettings:
                     )
         elif experiment.run_kind != "functional_smoke":
             raise ValueError("Synthetic data is limited to functional_smoke runs")
+        if self.cycle_manifest_policy == WINDOWED_CYCLE_MANIFEST_POLICY:
+            if (
+                self.window_source_tokens_per_task is not None
+                and (
+                    not isinstance(self.window_source_tokens_per_task, int)
+                    or self.window_source_tokens_per_task <= 0
+                )
+            ):
+                raise ValueError(
+                    "data.window_source_tokens_per_task must be a positive integer"
+                )
+            source_tokens = (
+                self.window_source_tokens_per_task
+                if self.window_source_tokens_per_task is not None
+                else experiment.tokens_per_task * experiment.cycles
+            )
+            source_budget = resolve_token_budget(
+                source_tokens,
+                experiment.sequence_length,
+                policy=experiment.token_budget_policy,
+            )
+            task_budget = resolve_token_budget(
+                experiment.tokens_per_task,
+                experiment.sequence_length,
+                policy=experiment.token_budget_policy,
+            )
+            if source_budget.effective_complete_sequences < (
+                experiment.cycles
+                * task_budget.effective_complete_sequences
+            ):
+                raise ValueError(
+                    "data.window_source_tokens_per_task does not contain all "
+                    "configured disjoint cycle windows"
+                )
+        elif self.window_source_tokens_per_task is not None:
+            raise ValueError(
+                "data.window_source_tokens_per_task is only valid for "
+                "disjoint_sequence_windows_v1"
+            )
         for name, value in (
             ("max_cache_bytes", self.max_cache_bytes),
             ("max_generated_bytes", self.max_generated_bytes),
@@ -348,6 +388,7 @@ class LauncherSettings:
     disk_free_floor_bytes: int = 8_589_934_592
     checkpoint_bytes_per_parameter: int = 20
     checkpoint_fixed_overhead_bytes: int = 67_108_864
+    ddp_debug_assert_synced: bool = True
 
     def validate(self, training: TrainingSettings) -> None:
         if len(set(self.gpu_ids)) != len(self.gpu_ids):
@@ -550,6 +591,10 @@ class LauncherConfig:
         # defaults keeps existing launcher/checkpoint identities resumable.
         if values["data"].get("language_validation_manifest_template") is None:
             values["data"].pop("language_validation_manifest_template", None)
+        if values["data"].get("window_source_tokens_per_task") is None:
+            values["data"].pop("window_source_tokens_per_task", None)
         if values.get("forgetting") is None:
             values.pop("forgetting", None)
+        if values["launcher"].get("ddp_debug_assert_synced") is True:
+            values["launcher"].pop("ddp_debug_assert_synced", None)
         return values

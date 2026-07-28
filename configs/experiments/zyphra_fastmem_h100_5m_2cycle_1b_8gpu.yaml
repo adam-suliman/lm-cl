@@ -1,13 +1,13 @@
 schema_version: 1
 
 experiment:
-  name: zyphra-fastmem-h100-12m-5cycle-1b
+  name: zyphra-fastmem-h100-5m-2cycle-1b-8gpu
   output_root: ${LM_CL_OUTPUT_ROOT}
   repository_root: ../..
   seed: [81010, 81011, 81012]
   models: [transformer, fastmem_rmt]
-  model_size: 12m
-  cycles: 5
+  model_size: 5m
+  cycles: 2
   tokens_per_task: 1000000000
   token_budget_policy: floor_complete_sequences_v1
   sequence_length: 2048
@@ -21,6 +21,7 @@ data:
   manifest_root: ${LM_CL_DATA_ROOT}/generated/stages
   manifest_template: zyphra-cycle-0000-{language}-task-{source_task_index:04d}-{effective_tokens}/manifest.json
   cycle_manifest_policy: disjoint_sequence_windows_v1
+  window_source_tokens_per_task: 5000000000
   tokenizer_manifest: ${LM_CL_DATA_ROOT}/generated/tokenizers/qwen3/manifest.json
   prepare_if_missing: true
   dataset_cache_root: ${LM_CL_DATA_ROOT}/hf-cache
@@ -61,14 +62,14 @@ fastmem:
   slow_accumulation_k: 2
 
 launcher:
-  gpu_ids: [4, 5, 6, 7]
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
   jobs_per_gpu: 1
-  gpus_per_job: 1
-  max_parallel_jobs: 4
+  gpus_per_job: 4
+  max_parallel_jobs: 2
   start_method: subprocess
   fail_fast: true
   retry_count: 1
-  rendezvous_port_base: 30500
+  rendezvous_port_base: 29500
   disk_free_floor_bytes: 21474836480
   checkpoint_bytes_per_parameter: 20
   checkpoint_fixed_overhead_bytes: 67108864

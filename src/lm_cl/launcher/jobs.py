@@ -204,7 +204,7 @@ def _distributed(config: LauncherConfig) -> DistributedConfig | None:
         ),
         ddp_broadcast_buffers=False,
         ddp_find_unused_parameters=False,
-        debug_assert_synced=True,
+        debug_assert_synced=config.launcher.ddp_debug_assert_synced,
         per_rank_diagnostic_logs=False,
     )
     distributed.validate(runtime_device="cuda")
@@ -258,6 +258,7 @@ def _runtime(
             config.tracking.tensorboard_flush_seconds
         ),
         tensorboard_log_every_batches=config.tracking.log_every_batches,
+        diagnostic_norm_interval_steps=config.tracking.log_every_batches,
     )
 
 

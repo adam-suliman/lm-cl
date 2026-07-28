@@ -46,11 +46,16 @@ def resolve_device(requested: str) -> torch.device:
 
 
 def tensor_norm(tensors: Iterator[torch.Tensor]) -> float:
-    squares = torch.zeros((), dtype=torch.float64)
+    groups: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
     for tensor in tensors:
         value = tensor.detach()
-        squares += value.double().pow(2).sum().cpu()
-    return float(squares.sqrt())
+        groups.setdefault((value.device, value.dtype), []).append(value)
+    group_squares: list[float] = []
+    for values in groups.values():
+        norms = torch._foreach_norm(values, 2.0)
+        stacked = torch.stack(norms)
+        group_squares.append(float(stacked.double().pow(2).sum().cpu()))
+    return math.sqrt(math.fsum(group_squares))
 
 
 def conditioned_backward_reference_targets(
@@ -327,6 +332,13 @@ class ContinualTrainer:
             return nullcontext()
         dtype = torch.float16 if precision == "fp16" else torch.bfloat16
         return torch.autocast(device_type=self.device.type, dtype=dtype)
+
+    def _diagnostic_parameter_norm(self, step: int) -> float | None:
+        """Compute the expensive full-model norm only at logging intervals."""
+        interval = self.config.runtime.diagnostic_norm_interval_steps
+        if step % interval:
+            return None
+        return tensor_norm(self.model.parameters())
 
     @staticmethod
     def _packed_source_signature(
@@ -711,7 +723,9 @@ class ContinualTrainer:
             ),
             "learning_rate": learning_rate,
             "gradient_norm": gradient_norm,
-            "parameter_norm": tensor_norm(self.model.parameters()),
+            "parameter_norm": self._diagnostic_parameter_norm(
+                self.state.global_slow_steps
+            ),
             "window_logical_batches": self.state.window_logical_batches,
             "tail_flush": tail_flush,
         }
@@ -920,7 +934,9 @@ class ContinualTrainer:
             "mean_loss": mean_loss,
             "input_token_count": input_tokens,
             "throughput_input_tokens_per_second": input_tokens / elapsed,
-            "parameter_norm": tensor_norm(self.model.parameters()),
+            "parameter_norm": self._diagnostic_parameter_norm(
+                self.state.global_logical_batches
+            ),
             "gradient_norm": None,
             "learning_rate": (
                 None if self.scheduler is None else self.scheduler.current_lr

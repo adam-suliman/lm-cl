@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import fcntl
 from bisect import bisect_right
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -14,9 +15,13 @@ import numpy as np
 from lm_cl.config.data_schema import PACKED_FORMAT_VERSION
 from lm_cl.data.tokenizer import sha256_file
 from lm_cl.data.types import TokenBatch, TokenPosition
+from lm_cl.data.storage import atomic_write_json
 
 
 UINT32_LE = np.dtype("<u4")
+PACKED_VALIDATION_CACHE_SCHEMA_VERSION = 1
+PACKED_VALIDATION_CACHE_FILENAME = ".packed-validation-cache-v1.json"
+PACKED_VALIDATION_LOCK_FILENAME = ".packed-validation-cache-v1.lock"
 
 
 def manifest_content_hash(manifest: dict[str, Any]) -> str:
@@ -435,6 +440,106 @@ def validate_packed_shards(
     }
 
 
+def _packed_validation_signature(
+    stage_dir: Path,
+    manifest: dict[str, Any],
+) -> list[dict[str, int | str]]:
+    paths = [stage_dir / "manifest.json"]
+    paths.extend(
+        stage_dir / shard["filename"]
+        for shard in manifest["shards"]
+    )
+    boundaries = manifest.get("boundaries")
+    if isinstance(boundaries, dict) and boundaries.get("filename"):
+        paths.append(stage_dir / boundaries["filename"])
+    signature: list[dict[str, int | str]] = []
+    for path in paths:
+        stat = path.stat()
+        signature.append(
+            {
+                "filename": path.name,
+                "device": stat.st_dev,
+                "inode": stat.st_ino,
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "ctime_ns": stat.st_ctime_ns,
+            }
+        )
+    return signature
+
+
+def validate_packed_shards_cached(
+    path: str | Path,
+    *,
+    expected_tokenizer_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Reuse a prior full audit only while every packed file is unchanged."""
+    stage_dir, manifest = load_packed_manifest(path)
+    cache_path = stage_dir / PACKED_VALIDATION_CACHE_FILENAME
+    lock_path = stage_dir / PACKED_VALIDATION_LOCK_FILENAME
+    try:
+        lock_handle = lock_path.open("a+b")
+    except OSError:
+        return validate_packed_shards(
+            path,
+            expected_tokenizer_manifest_sha256=(
+                expected_tokenizer_manifest_sha256
+            ),
+        )
+    with lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        signature_before = _packed_validation_signature(stage_dir, manifest)
+        cached: dict[str, Any] | None = None
+        if cache_path.is_file():
+            try:
+                value = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    cached = value
+            except (OSError, json.JSONDecodeError):
+                cached = None
+        if (
+            cached is not None
+            and cached.get("schema_version")
+            == PACKED_VALIDATION_CACHE_SCHEMA_VERSION
+            and cached.get("status") == "valid"
+            and cached.get("manifest_content_sha256")
+            == manifest["manifest_content_sha256"]
+            and cached.get("ordered_data_sha256")
+            == manifest["ordered_data_sha256"]
+            and cached.get("expected_tokenizer_manifest_sha256")
+            == expected_tokenizer_manifest_sha256
+            and cached.get("file_signature") == signature_before
+            and isinstance(cached.get("validation_result"), dict)
+        ):
+            return dict(cached["validation_result"])
+        result = validate_packed_shards(
+            path,
+            expected_tokenizer_manifest_sha256=(
+                expected_tokenizer_manifest_sha256
+            ),
+        )
+        signature_after = _packed_validation_signature(stage_dir, manifest)
+        if signature_after != signature_before:
+            raise ValueError("Packed source files changed during validation")
+        atomic_write_json(
+            cache_path,
+            {
+                "schema_version": PACKED_VALIDATION_CACHE_SCHEMA_VERSION,
+                "status": "valid",
+                "manifest_content_sha256": manifest[
+                    "manifest_content_sha256"
+                ],
+                "ordered_data_sha256": manifest["ordered_data_sha256"],
+                "expected_tokenizer_manifest_sha256": (
+                    expected_tokenizer_manifest_sha256
+                ),
+                "file_signature": signature_after,
+                "validation_result": result,
+            },
+        )
+        return result
+
+
 class PackedShardSource:
     def __init__(
         self,
@@ -443,7 +548,7 @@ class PackedShardSource:
         drop_incomplete_sequence: bool = True,
         expected_tokenizer_manifest_sha256: str | None = None,
     ):
-        validate_packed_shards(
+        validate_packed_shards_cached(
             path,
             expected_tokenizer_manifest_sha256=(
                 expected_tokenizer_manifest_sha256

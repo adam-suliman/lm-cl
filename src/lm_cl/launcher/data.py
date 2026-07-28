@@ -26,7 +26,10 @@ from lm_cl.config.data_schema import (
     TokenizerReference,
 )
 from lm_cl.config.data_yaml import save_data_pipeline_config
-from lm_cl.data.packed import load_packed_manifest, validate_packed_shards
+from lm_cl.data.packed import (
+    load_packed_manifest,
+    validate_packed_shards_cached,
+)
 from lm_cl.data.registry import OverlapRegistry
 from lm_cl.data.storage import atomic_write_json
 from lm_cl.data.tokenizer import (
@@ -559,7 +562,11 @@ def render_language_validation_manifest_path(
 def _source_task_budget(config: LauncherConfig) -> TokenBudget:
     requested = config.experiment.tokens_per_task
     if config.data.cycle_manifest_policy == WINDOWED_CYCLE_MANIFEST_POLICY:
-        requested *= config.experiment.cycles
+        requested = (
+            config.data.window_source_tokens_per_task
+            if config.data.window_source_tokens_per_task is not None
+            else requested * config.experiment.cycles
+        )
     return resolve_token_budget(
         requested,
         config.experiment.sequence_length,
@@ -581,7 +588,7 @@ def _manifest_identity(
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Packed manifest not found: {manifest_path}")
     if full_checksum_validation:
-        validate_packed_shards(
+        validate_packed_shards_cached(
             manifest_path,
             expected_tokenizer_manifest_sha256=(
                 tokenizer_manifest["manifest_content_sha256"]

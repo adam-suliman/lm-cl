@@ -47,7 +47,10 @@ SHA-256, tokenizer identity, and requested/effective count is frozen in the
 resolved cycle×language matrix.
 
 The windowed policy materializes or opens one cycle-0 source per language whose
-requested budget is `cycles * tokens_per_task`. Logical cycle `c` reads the
+requested budget defaults to `cycles * tokens_per_task`. An explicit
+`window_source_tokens_per_task` may retain a larger already frozen source when
+running a shorter logical horizon; it must contain every configured disjoint
+window. Logical cycle `c` reads the
 half-open complete-sequence interval
 `[c * task_sequences, (c + 1) * task_sequences)`. The resolved contract records
 the source hashes, exact range, and a distinct view SHA-256. Overlapping or
@@ -98,6 +101,11 @@ the release preset is 0.005.
 disjoint groups and invokes the existing DDP implementation. Impossible or
 overlapping assignments fail. Disk admission estimates every task-boundary,
 cycle, and probe checkpoint because this package never silently deletes one.
+`ddp_debug_assert_synced` performs full state hashing after every update and is
+intended for smoke/debug gates; H100 production presets disable it while
+retaining mandatory checkpoint-boundary state-digest verification. Expensive
+full-model norm diagnostics and TensorBoard optimizer scalars follow
+`tracking.log_every_batches`; JSONL loss and update records remain complete.
 
 Training scalar steps are cumulative logical batches. Probe-curve steps are
 probe cumulative input tokens in per-cycle TensorBoard subdirectories. Cycle

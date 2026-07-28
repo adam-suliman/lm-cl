@@ -229,6 +229,13 @@ def collective_raise_if_any(
     *,
     prefix: str,
 ) -> None:
+    failed = all_reduce_int(
+        int(local_error is not None),
+        context,
+        op=dist.ReduceOp.MAX,
+    )
+    if not failed:
+        return
     errors: list[str | None] = [None for _ in range(context.world_size)]
     dist.all_gather_object(errors, local_error)
     failures = [

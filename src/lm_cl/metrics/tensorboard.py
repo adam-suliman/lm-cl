@@ -117,7 +117,10 @@ def log_record_to_tensorboard(
         for tag, value in scalar_fields.items():
             if value is not None:
                 tracker.scalar(tag, value, logical_step)
-    elif event == "optimizer_step":
+    elif (
+        event == "optimizer_step"
+        and logical_step % log_every_batches == 0
+    ):
         value = record.get("gradient_norm")
         if value is not None:
             tracker.scalar("train/slow_gradient_norm", value, logical_step)
