@@ -7,6 +7,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -41,6 +42,7 @@ from lm_cl.metrics import JsonlMetricLogger, TensorBoardTracker
 from lm_cl.metrics import update_forgetting_metrics
 from lm_cl.config import DataConfig, TokenizerReference, TrainSourceConfig
 from lm_cl.training import ContinualTrainer, ProbeTrainer
+from lm_cl.training import continual as continual_training
 from lm_cl.training.checkpoint import load_checkpoint, sha256_file
 from lm_cl.training.distributed import state_digest
 from lm_cl.data.sources import ArrayTokenSource
@@ -230,7 +232,10 @@ def test_windowed_data_contract_records_distinct_nonoverlapping_views(
         ),
     )
 
+    identity_calls = []
+
     def identity(path, **kwargs):
+        identity_calls.append(str(path))
         budget = kwargs["budget"]
         language = kwargs["expected_language"]
         purpose = (
@@ -295,6 +300,53 @@ def test_windowed_data_contract_records_distinct_nonoverlapping_views(
     assert set(contract["language_validation_manifests"]) == set(
         PUBLIC_LANGUAGE_ORDER
     )
+    assert len(identity_calls) == 18
+    assert sum("zyphra-cycle-0000" in path for path in identity_calls) == 8
+
+
+def test_trainer_reuses_validated_packed_source_and_detects_mutation(
+    tmp_path, monkeypatch
+):
+    config = _config(
+        tmp_path,
+        name="packed-source-cache",
+        models=["transformer"],
+        cycles=1,
+        tensorboard=False,
+    )
+    _, jobs = _jobs(config)
+    trainer = ContinualTrainer(build_continual_job_config(config, jobs[0]))
+
+    stage_dir = tmp_path / "packed-stage"
+    stage_dir.mkdir()
+    (stage_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    shard_path = stage_dir / "tokens-00000.bin"
+    shard_path.write_bytes(b"1234")
+    source = SimpleNamespace(
+        stage_dir=stage_dir,
+        manifest={
+            "shards": [{"filename": shard_path.name}],
+            "boundaries": None,
+        },
+    )
+    source_config = SimpleNamespace(
+        packed=SimpleNamespace(to_dict=lambda: {"source": "same"})
+    )
+    calls = []
+
+    def fake_build_source(*args, **kwargs):
+        calls.append((args, kwargs))
+        return source, {"manifest_content_sha256": "a" * 64}, -100
+
+    monkeypatch.setattr(continual_training, "build_source", fake_build_source)
+    first = trainer._open_source(source_config)
+    second = trainer._open_source(source_config)
+    assert first[0] is second[0]
+    assert len(calls) == 1
+
+    shard_path.write_bytes(b"changed-size")
+    with pytest.raises(ValueError, match="changed after in-process validation"):
+        trainer._open_source(source_config)
 
 
 def test_lower_is_better_forgetting_is_measured_from_best_history():

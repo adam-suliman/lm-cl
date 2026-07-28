@@ -548,6 +548,39 @@ def resolve_data_contract(
     tokenizer_ref, tokenizer_manifest, tokenizer_file_sha = _tokenizer_reference(
         config
     )
+    identity_cache: dict[
+        tuple[str, str | None, int | None, int | None, TokenBudget | None],
+        dict[str, Any],
+    ] = {}
+
+    def manifest_identity_once(
+        manifest_path: Path,
+        *,
+        expected_language: str | None,
+        expected_cycle: int | None,
+        expected_task_index: int | None,
+        budget: TokenBudget | None,
+    ) -> dict[str, Any]:
+        key = (
+            str(manifest_path.resolve()),
+            expected_language,
+            expected_cycle,
+            expected_task_index,
+            budget,
+        )
+        if key not in identity_cache:
+            identity_cache[key] = _manifest_identity(
+                manifest_path,
+                expected_language=expected_language,
+                expected_cycle=expected_cycle,
+                expected_task_index=expected_task_index,
+                budget=budget,
+                tokenizer_manifest=tokenizer_manifest,
+                tokenizer_manifest_file_sha256=tokenizer_file_sha,
+                full_checksum_validation=full_checksum_validation,
+            )
+        return dict(identity_cache[key])
+
     matrix = []
     paths: set[str] = set()
     ordered_hashes: set[str] = set()
@@ -570,15 +603,12 @@ def resolve_data_contract(
                 task_index=source_task_index,
                 budget=source_manifest_budget,
             )
-            identity = _manifest_identity(
+            identity = manifest_identity_once(
                 manifest_path,
                 expected_language=language,
                 expected_cycle=source_cycle,
                 expected_task_index=source_task_index,
                 budget=source_manifest_budget,
-                tokenizer_manifest=tokenizer_manifest,
-                tokenizer_manifest_file_sha256=tokenizer_file_sha,
-                full_checksum_validation=full_checksum_validation,
             )
             identity["tokenizer_manifest_path"] = config.data.tokenizer_manifest
             if windowed:
@@ -657,15 +687,12 @@ def resolve_data_contract(
                 language=language,
                 budget=validation_budget,
             )
-            identity = _manifest_identity(
+            identity = manifest_identity_once(
                 manifest_path,
                 expected_language=language,
                 expected_cycle=0,
                 expected_task_index=800_000 + language_index,
                 budget=validation_budget,
-                tokenizer_manifest=tokenizer_manifest,
-                tokenizer_manifest_file_sha256=tokenizer_file_sha,
-                full_checksum_validation=full_checksum_validation,
             )
             if identity["purpose"] != "language_validation":
                 raise ValueError(
@@ -676,27 +703,21 @@ def resolve_data_contract(
             )
             language_validation[language] = identity
 
-    probe_training = _manifest_identity(
+    probe_training = manifest_identity_once(
         Path(config.data.probe_training_manifest or "").resolve(),
         expected_language="vi",
         expected_cycle=None,
         expected_task_index=None,
         budget=probe_budget,
-        tokenizer_manifest=tokenizer_manifest,
-        tokenizer_manifest_file_sha256=tokenizer_file_sha,
-        full_checksum_validation=full_checksum_validation,
     )
     probe_training["tokenizer_manifest_path"] = config.data.tokenizer_manifest
     validation_path = Path(config.data.probe_validation_manifest or "").resolve()
-    probe_validation = _manifest_identity(
+    probe_validation = manifest_identity_once(
         validation_path,
         expected_language="vi",
         expected_cycle=None,
         expected_task_index=None,
         budget=None,
-        tokenizer_manifest=tokenizer_manifest,
-        tokenizer_manifest_file_sha256=tokenizer_file_sha,
-        full_checksum_validation=full_checksum_validation,
     )
     probe_validation["tokenizer_manifest_path"] = config.data.tokenizer_manifest
     if probe_validation["packed_complete_sequence_count"] < (

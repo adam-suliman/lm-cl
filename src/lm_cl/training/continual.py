@@ -20,7 +20,6 @@ from lm_cl.data import (
     TokenBatch,
     TokenPosition,
     open_token_batch_source,
-    validate_packed_shards,
 )
 from lm_cl.metrics import JsonlMetricLogger, update_forgetting_metrics
 from lm_cl.models import RMTZyphraTransformer, ZyphraTransformer
@@ -138,12 +137,6 @@ def build_source(
         )
     assert source_config.packed is not None
     packed = source_config.packed
-    stage_dir = (
-        Path(packed.storage.generated_root)
-        / "stages"
-        / packed.stage.stage_id
-    )
-    validate_packed_shards(stage_dir)
     source = open_token_batch_source(packed)
     if source.manifest["tokenizer"]["model_embedding_vocab_size"] != (
         model_vocab_size
@@ -314,6 +307,15 @@ class ContinualTrainer:
         self._optimizer_generation = 0
         self._backward_reference_targets = 1
         self.active_memory: torch.Tensor | None = None
+        self._packed_source_cache: dict[
+            str,
+            tuple[
+                Any,
+                dict[str, Any],
+                int,
+                tuple[tuple[str, int, int], ...],
+            ],
+        ] = {}
 
     @property
     def config_sha256(self) -> str:
@@ -325,6 +327,54 @@ class ContinualTrainer:
             return nullcontext()
         dtype = torch.float16 if precision == "fp16" else torch.bfloat16
         return torch.autocast(device_type=self.device.type, dtype=dtype)
+
+    @staticmethod
+    def _packed_source_signature(
+        source: Any,
+    ) -> tuple[tuple[str, int, int], ...]:
+        paths = [source.stage_dir / "manifest.json"]
+        paths.extend(
+            source.stage_dir / shard["filename"]
+            for shard in source.manifest["shards"]
+        )
+        boundaries = source.manifest.get("boundaries")
+        if isinstance(boundaries, dict) and boundaries.get("filename"):
+            paths.append(source.stage_dir / boundaries["filename"])
+        signature = []
+        for path in paths:
+            stat = path.stat()
+            signature.append((str(path), stat.st_size, stat.st_mtime_ns))
+        return tuple(signature)
+
+    def _open_source(
+        self, source_config: TrainSourceConfig
+    ) -> tuple[Any, dict[str, Any], int]:
+        if source_config.packed is None:
+            return build_source(
+                source_config,
+                model_vocab_size=self.config.model.vocab_size,
+            )
+        key = canonical_sha256(source_config.packed.to_dict())
+        cached = self._packed_source_cache.get(key)
+        if cached is not None:
+            source, identity, ignore_index, signature = cached
+            if self._packed_source_signature(source) != signature:
+                raise ValueError(
+                    "Packed source files changed after in-process validation"
+                )
+            return source, dict(identity), ignore_index
+        source, identity, ignore_index = build_source(
+            source_config,
+            model_vocab_size=self.config.model.vocab_size,
+        )
+        signature = self._packed_source_signature(source)
+        self._packed_source_cache[key] = (
+            source,
+            dict(identity),
+            ignore_index,
+            signature,
+        )
+        return source, identity, ignore_index
 
     def _prepare_output(self, *, resume: bool) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -906,9 +956,8 @@ class ContinualTrainer:
     ) -> dict[str, Any] | None:
         if task.validation_source is None:
             return None
-        source, identity, ignore_index = build_source(
-            task.validation_source,
-            model_vocab_size=self.config.model.vocab_size,
+        source, identity, ignore_index = self._open_source(
+            task.validation_source
         )
         iterator = source.iter_batches(
             sequence_length=task.validation_source.sequence_length,
@@ -1254,9 +1303,8 @@ class ContinualTrainer:
                 and self.state.phase == "task_active"
                 and self.state.current_task_index == task_index
             )
-            source, source_identity, ignore_index = build_source(
-                task.train_source,
-                model_vocab_size=self.config.model.vocab_size,
+            source, source_identity, ignore_index = self._open_source(
+                task.train_source
             )
             source_identity = _task_window_source_identity(
                 source_identity, task

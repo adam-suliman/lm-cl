@@ -136,7 +136,9 @@ The H100 presets reuse the eight existing cycle-0 5B training stages without
 copying token files. Each appearance consumes 488,281 complete sequences, or
 999,999,488 input tokens. Five windows consume 2,441,405 of the 2,441,406
 sequences in each source, leaving one sequence unused. The same window is never
-replayed in another cycle.
+replayed in another cycle. Shared backing manifests are checksum-validated only
+once per preflight, and each trainer reuses its validated memory maps while
+checking that the underlying files have not changed.
 
 Forgetting is evaluated after every language boundary on eight fixed held-out
 language-validation stages. These are selected by the existing SHA-256 document
