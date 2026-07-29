@@ -160,7 +160,81 @@ def _validate_source_data_identity(payload: dict[str, Any]) -> None:
     identity = payload.get("source_identity")
     if not isinstance(identity, dict):
         raise ValueError("Probe source checkpoint lacks source identity")
+    base_identity = dict(identity)
+    sequence_window = base_identity.pop("sequence_window", None)
+    if sequence_window is not None:
+        required_window_fields = {
+            "sequence_start",
+            "sequence_count",
+            "sequence_end_exclusive",
+            "input_token_count",
+            "view_sha256",
+        }
+        if (
+            not isinstance(sequence_window, dict)
+            or set(sequence_window) != required_window_fields
+        ):
+            raise ValueError("Probe source sequence-window fields are invalid")
+        values = {
+            key: sequence_window[key]
+            for key in (
+                "sequence_start",
+                "sequence_count",
+                "sequence_end_exclusive",
+                "input_token_count",
+            )
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in values.values()
+        ):
+            raise ValueError("Probe source sequence-window values must be integers")
+        if values["sequence_start"] < 0 or values["sequence_count"] <= 0:
+            raise ValueError("Probe source sequence window is empty or negative")
+        if values["sequence_end_exclusive"] != (
+            values["sequence_start"] + values["sequence_count"]
+        ):
+            raise ValueError("Probe source sequence-window bounds are inconsistent")
+        task_index = payload["trainer_state"]["current_task_index"]
+        tasks = payload["resolved_config"]["tasks"]
+        if (
+            isinstance(task_index, bool)
+            or not isinstance(task_index, int)
+            or task_index < 0
+            or task_index >= len(tasks)
+        ):
+            raise ValueError("Probe source task index is invalid")
+        task = tasks[task_index]
+        source = task["train_source"]
+        source_config = (
+            source.get("synthetic")
+            if source.get("kind") == "synthetic"
+            else source.get("packed")
+        )
+        if not isinstance(source_config, dict):
+            raise ValueError("Probe source task data configuration is invalid")
+        reader = source_config.get("reader", source_config)
+        sequence_length = reader.get("sequence_length")
+        if (
+            isinstance(sequence_length, bool)
+            or not isinstance(sequence_length, int)
+            or sequence_length <= 1
+        ):
+            raise ValueError("Probe source sequence length is invalid")
+        if values["input_token_count"] != (
+            values["sequence_count"] * sequence_length
+        ):
+            raise ValueError("Probe source sequence-window token count differs")
+        unhashed_window = dict(sequence_window)
+        claimed_view_sha256 = unhashed_window.pop("view_sha256")
+        expected_view_sha256 = canonical_sha256(
+            {"source": base_identity, "window": unhashed_window}
+        )
+        if claimed_view_sha256 != expected_view_sha256:
+            raise ValueError("Probe source sequence-window SHA-256 differs")
     if identity.get("kind") == "synthetic":
+        if set(base_identity) != {"kind", "config_sha256"}:
+            raise ValueError("Probe synthetic source identity fields are invalid")
         checksum = identity.get("config_sha256")
         if (
             not isinstance(checksum, str)
@@ -179,7 +253,7 @@ def _validate_source_data_identity(payload: dict[str, Any]) -> None:
         "tokenizer_manifest_path",
         "tokenizer_manifest_sha256",
     }
-    if set(identity) != required:
+    if set(base_identity) != required:
         raise ValueError("Probe packed source identity fields are incomplete")
     manifest_path = Path(identity["manifest_path"]).expanduser().resolve()
     if manifest_path.name != "manifest.json" or not manifest_path.is_file():
@@ -196,6 +270,10 @@ def _validate_source_data_identity(payload: dict[str, Any]) -> None:
         raise ValueError("Probe packed source manifest hash differs")
     if report["ordered_data_sha256"] != identity["ordered_data_sha256"]:
         raise ValueError("Probe packed source ordered-data hash differs")
+    if sequence_window is not None and sequence_window[
+        "sequence_end_exclusive"
+    ] > (report["token_count"] // sequence_length):
+        raise ValueError("Probe source sequence window exceeds packed data")
     tokenizer_path = Path(
         identity["tokenizer_manifest_path"]
     ).expanduser().resolve()
