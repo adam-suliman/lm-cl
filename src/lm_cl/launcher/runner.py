@@ -392,6 +392,22 @@ def _load_completed_probe_summaries(checkpoint_payload: dict[str, Any]) -> list[
     return result
 
 
+def _probe_summary_source_path(summary: dict[str, Any]) -> Path:
+    source = summary.get("source_checkpoint")
+    source_sha256 = summary.get("source_checkpoint_sha256_before")
+    if (
+        not isinstance(source, dict)
+        or not isinstance(source.get("path"), str)
+        or not source["path"]
+        or source.get("sha256") != source_sha256
+    ):
+        raise ValueError("Stored probe source-checkpoint identity is invalid")
+    path = Path(source["path"]).expanduser()
+    if not path.is_absolute():
+        raise ValueError("Stored probe source-checkpoint path is not absolute")
+    return path.resolve()
+
+
 def _recover_completed_probe_summaries(
     job_dir: Path,
     checkpoint_payload: dict[str, Any] | None,
@@ -918,6 +934,9 @@ def run_resolved_job(
                         raise ValueError(
                             f"Stored probe identity is invalid for cycle {cycle_index + 1}"
                         )
+                    summary_source_checkpoint = _probe_summary_source_path(
+                        summary
+                    )
                 expected_experiment_state = _cycle_experiment_state(
                     spec=spec,
                     resolved=resolved,
@@ -955,8 +974,7 @@ def run_resolved_job(
                         if (
                             summary["source_checkpoint_sha256_before"]
                             != source_sha
-                            or Path(summary["source_checkpoint"]).resolve()
-                            != source_checkpoint
+                            or summary_source_checkpoint != source_checkpoint
                         ):
                             raise ValueError(
                                 "Stored probe summary has another Russian source"

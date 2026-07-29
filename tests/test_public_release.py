@@ -1145,7 +1145,10 @@ def test_retry_backfills_failed_probe_before_training_next_cycle(
             "arithmetic_mean_recorded_validation_ce": 1.5,
         }
         return {
-            "source_checkpoint": str(source_checkpoint),
+            "source_checkpoint": {
+                "path": str(source_checkpoint),
+                "sha256": source_sha256,
+            },
             "source_checkpoint_sha256_before": source_sha256,
             "source_checkpoint_sha256_after": source_sha256,
             "auc_report": {"curves": {"not_applicable": curve}},
