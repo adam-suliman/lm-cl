@@ -1178,6 +1178,47 @@ def test_retry_backfills_failed_probe_before_training_next_cycle(
     ] == [0, 1]
 
 
+def test_uncheckpointed_probe_retry_archives_partial_output(tmp_path):
+    probe_dir = tmp_path / "probe"
+    tensorboard_dir = tmp_path / "tensorboard" / "probe-cycle-0001"
+    probe_dir.mkdir()
+    tensorboard_dir.mkdir(parents=True)
+    metrics = probe_dir / "metrics.jsonl"
+    resolved = probe_dir / "resolved_probe_config.yaml"
+    event = tensorboard_dir / "events.out.tfevents.test"
+    metrics.write_text('{"event":"probe_start"}\n', encoding="utf-8")
+    resolved.write_text("schema_version: 1\n", encoding="utf-8")
+    event.write_bytes(b"partial tensorboard evidence")
+    probe = SimpleNamespace(
+        runtime=SimpleNamespace(
+            output_dir=str(probe_dir),
+            metrics_jsonl=str(metrics),
+            tensorboard_dir=str(tensorboard_dir),
+        )
+    )
+
+    moved = launcher_runner._archive_uncheckpointed_probe_retry(
+        probe, cycle_index=0
+    )
+
+    assert {item["kind"] for item in moved} == {
+        "metrics",
+        "resolved_config",
+        "tensorboard",
+    }
+    assert not metrics.exists()
+    assert not resolved.exists()
+    assert not tensorboard_dir.exists()
+    manifests = list(
+        (probe_dir / "failed-attempts").glob("*/archive_manifest.json")
+    )
+    assert len(manifests) == 1
+    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    assert manifest["status"] == "archived_uncheckpointed_probe_attempt"
+    archived = {Path(item["archived_path"]) for item in manifest["moved"]}
+    assert all(path.exists() for path in archived)
+
+
 def _resolved_pair(tmp_path):
     one = _config(
         tmp_path,

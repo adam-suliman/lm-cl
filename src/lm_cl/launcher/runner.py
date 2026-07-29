@@ -248,6 +248,61 @@ def _latest_probe_checkpoint(probe_dir: Path, config_sha256: str) -> Path | None
     return sorted((item[1] for item in winners), key=str)[0]
 
 
+def _archive_uncheckpointed_probe_retry(
+    probe: Any,
+    *,
+    cycle_index: int,
+) -> list[dict[str, str]]:
+    probe_dir = Path(probe.runtime.output_dir).expanduser().resolve()
+    metrics_path = Path(probe.runtime.metrics_jsonl).expanduser()
+    if not metrics_path.is_absolute():
+        metrics_path = probe_dir / metrics_path
+    tensorboard_path: Path | None = None
+    if probe.runtime.tensorboard_dir is not None:
+        tensorboard_path = Path(probe.runtime.tensorboard_dir).expanduser()
+        if not tensorboard_path.is_absolute():
+            tensorboard_path = probe_dir / tensorboard_path
+        tensorboard_path = tensorboard_path.resolve()
+    candidates = [
+        ("metrics", metrics_path.resolve()),
+        ("resolved_config", probe_dir / "resolved_probe_config.yaml"),
+    ]
+    if tensorboard_path is not None:
+        candidates.append(("tensorboard", tensorboard_path))
+    existing = [(label, path) for label, path in candidates if path.exists()]
+    if not existing:
+        return []
+    archive = (
+        probe_dir
+        / "failed-attempts"
+        / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    )
+    archive.mkdir(parents=True, exist_ok=False)
+    moved: list[dict[str, str]] = []
+    for label, path in existing:
+        destination = archive / f"{label}-{path.name}"
+        shutil.move(str(path), str(destination))
+        moved.append(
+            {
+                "kind": label,
+                "original_path": str(path),
+                "archived_path": str(destination),
+            }
+        )
+    atomic_write_json(
+        archive / "archive_manifest.json",
+        {
+            "schema_version": 1,
+            "status": "archived_uncheckpointed_probe_attempt",
+            "archived_at_utc": datetime.now(timezone.utc).isoformat(),
+            "cycle_index": cycle_index,
+            "cycle_number": cycle_index + 1,
+            "moved": moved,
+        },
+    )
+    return moved
+
+
 def _validate_probe_results(
     results_path: Path,
     *,
@@ -304,6 +359,14 @@ def _run_or_resume_probe(
         probe_dir, canonical_sha256(probe.to_dict())
     )
     if resume_checkpoint is None:
+        checkpoint_files = sorted((probe_dir / "checkpoints").glob("*.pt"))
+        if checkpoint_files:
+            raise ValueError(
+                "Probe checkpoint directory contains no compatible resume checkpoint"
+            )
+        _archive_uncheckpointed_probe_retry(
+            probe, cycle_index=cycle_index
+        )
         module = "lm_cl.cli.run_probe"
         arguments = [str(config_path)]
     else:
