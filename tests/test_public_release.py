@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -20,7 +21,9 @@ from lm_cl.launcher.jobs import (
     build_continual_job_config,
     build_probe_job_config,
     expand_job_specs,
+    write_resolved_job,
 )
+from lm_cl.launcher import runner as launcher_runner
 from lm_cl.launcher.runner import StageProcessController
 from lm_cl.launcher.scheduler import (
     JobAssignment,
@@ -33,6 +36,8 @@ from lm_cl.launcher.schema import (
     resolve_token_budget,
 )
 from lm_cl.launcher.state import (
+    augment_cycle_checkpoint,
+    discover_unambiguous_latest_checkpoint,
     migrate_checkpoint_horizon,
     pointer_for_checkpoint,
     validate_horizon_extension,
@@ -50,7 +55,12 @@ from lm_cl.config import (
 from lm_cl.models import RMTZyphraTransformer
 from lm_cl.training import ContinualTrainer, ProbeTrainer
 from lm_cl.training import continual as continual_training
-from lm_cl.training.checkpoint import load_checkpoint, sha256_file
+from lm_cl.training.checkpoint import (
+    canonical_sha256,
+    load_checkpoint,
+    sha256_file,
+)
+from lm_cl.training import probe as probe_training
 from lm_cl.training.distributed import state_digest
 from lm_cl.data.sources import ArrayTokenSource
 
@@ -1004,6 +1014,165 @@ def test_latest_checkpoint_pointer_is_validated(tiny_runs):
     )
     assert loaded["completed_cycle_count"] == 1
     assert checkpoint == Path(result.checkpoint_path).resolve()
+
+
+def test_probe_accepts_and_authenticates_packed_sequence_window(
+    tmp_path, monkeypatch
+):
+    manifest_path = tmp_path / "stage" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text("{}", encoding="utf-8")
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text("{}", encoding="utf-8")
+    base_identity = {
+        "kind": "packed_shards",
+        "manifest_path": str(manifest_path),
+        "manifest_content_sha256": "1" * 64,
+        "ordered_data_sha256": "2" * 64,
+        "tokenizer_manifest_path": str(tokenizer_path),
+        "tokenizer_manifest_sha256": "3" * 64,
+    }
+    window = {
+        "sequence_start": 20,
+        "sequence_count": 10,
+        "sequence_end_exclusive": 30,
+        "input_token_count": 160,
+    }
+    window["view_sha256"] = canonical_sha256(
+        {"source": base_identity, "window": window}
+    )
+    payload = {
+        "source_identity": {**base_identity, "sequence_window": window},
+        "trainer_state": {"current_task_index": 0},
+        "resolved_config": {
+            "tasks": [
+                {
+                    "train_source": {
+                        "kind": "packed_shards",
+                        "packed": {"reader": {"sequence_length": 16}},
+                    }
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        probe_training,
+        "validate_packed_shards",
+        lambda *_args, **_kwargs: {
+            "manifest_content_sha256": "1" * 64,
+            "ordered_data_sha256": "2" * 64,
+            "token_count": 16 * 100,
+        },
+    )
+    monkeypatch.setattr(
+        probe_training,
+        "load_tokenizer_manifest",
+        lambda _path: {"manifest_content_sha256": "3" * 64},
+    )
+    probe_training._validate_source_data_identity(payload)
+    tampered = copy.deepcopy(payload)
+    tampered["source_identity"]["sequence_window"]["sequence_start"] += 1
+    with pytest.raises(ValueError, match="bounds are inconsistent"):
+        probe_training._validate_source_data_identity(tampered)
+
+
+def test_latest_checkpoint_prefers_augmented_cycle_over_raw_twin(
+    tiny_runs, tmp_path
+):
+    _, _, _, continual, result = tiny_runs["transformer"]
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    raw = checkpoint_dir / "task-0007-ru-boundary.pt"
+    shutil.copy2(result.checkpoint_path, raw)
+    augmented = checkpoint_dir / "cycle-0001-complete.pt"
+    augment_cycle_checkpoint(
+        raw,
+        output_path=augmented,
+        experiment_state={"completed_cycle_count": 1},
+    )
+    discovered = discover_unambiguous_latest_checkpoint(
+        tmp_path,
+        expected_config_sha256=canonical_sha256(continual.to_dict()),
+    )
+    assert discovered == augmented.resolve()
+
+
+def test_retry_backfills_failed_probe_before_training_next_cycle(
+    tmp_path, monkeypatch
+):
+    config = _config(
+        tmp_path,
+        name="probe-backfill",
+        models=["transformer"],
+        cycles=2,
+        tensorboard=False,
+    )
+    _, jobs = _jobs(config)
+    resolved_path = write_resolved_job(jobs[0])
+
+    monkeypatch.setattr(
+        launcher_runner,
+        "_run_or_resume_probe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected cycle-1 probe failure")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="injected cycle-1 probe failure"):
+        launcher_runner.run_resolved_job(
+            resolved_path, rendezvous_port=30400
+        )
+
+    events = []
+    original_continual_stage = launcher_runner._run_continual_stage
+
+    def recording_continual_stage(*args, **kwargs):
+        events.append(
+            ("continual", kwargs["stop_after_task_boundaries"])
+        )
+        return original_continual_stage(*args, **kwargs)
+
+    def complete_probe(*_args, **kwargs):
+        cycle_index = kwargs["cycle_index"]
+        source_checkpoint = kwargs["source_checkpoint"]
+        source_sha256 = kwargs["source_sha256"]
+        events.append(("probe", cycle_index))
+        curve = {
+            "step_0_validation_ce": 2.0,
+            "final_validation_ce": 1.0,
+            "primary_normalized_trapezoidal_auc": 1.5,
+            "raw_input_token_trapezoidal_auc": 3.0,
+            "raw_step_trapezoidal_auc": 1.5,
+            "arithmetic_mean_recorded_validation_ce": 1.5,
+        }
+        return {
+            "source_checkpoint": str(source_checkpoint),
+            "source_checkpoint_sha256_before": source_sha256,
+            "source_checkpoint_sha256_after": source_sha256,
+            "auc_report": {"curves": {"not_applicable": curve}},
+            "curve_records": [
+                {
+                    "memory_evaluation_mode": "not_applicable",
+                    "cumulative_input_tokens": 0,
+                    "mean_validation_ce": 2.0,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        launcher_runner, "_run_continual_stage", recording_continual_stage
+    )
+    monkeypatch.setattr(
+        launcher_runner, "_run_or_resume_probe", complete_probe
+    )
+    summary = launcher_runner.run_resolved_job(
+        resolved_path, rendezvous_port=30400, retry_resume=True
+    )
+    assert events == [("probe", 0), ("continual", 16), ("probe", 1)]
+    assert summary["status"] == "complete"
+    assert summary["cycles_completed"] == 2
+    assert [
+        item["cycle_index"] for item in summary["per_cycle_probe_auc"]
+    ] == [0, 1]
 
 
 def _resolved_pair(tmp_path):

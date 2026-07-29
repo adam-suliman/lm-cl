@@ -266,7 +266,7 @@ def discover_unambiguous_latest_checkpoint(
     checkpoint_dir = Path(job_dir).resolve() / "checkpoints"
     if not checkpoint_dir.is_dir():
         return None
-    candidates: list[tuple[tuple[int, int, int], Path, str]] = []
+    candidates: list[tuple[tuple[int, int, int], Path, str, bool]] = []
     for path in checkpoint_dir.glob("*.pt"):
         try:
             payload = load_checkpoint(path, map_location="cpu")
@@ -280,13 +280,35 @@ def discover_unambiguous_latest_checkpoint(
             int(state["global_logical_batches"]),
             1 if state["phase"] == "task_boundary" else 0,
         )
-        candidates.append((progress, path.resolve(), sha256_file(path)))
+        completed_tasks = _completed_tasks(state)
+        completed_cycles = completed_tasks // len(PUBLIC_LANGUAGE_ORDER)
+        experiment_state = payload.get("experiment_state")
+        is_augmented_cycle_checkpoint = (
+            state["phase"] == "task_boundary"
+            and completed_tasks > 0
+            and completed_tasks % len(PUBLIC_LANGUAGE_ORDER) == 0
+            and path.name == f"cycle-{completed_cycles:04d}-complete.pt"
+            and isinstance(experiment_state, dict)
+            and experiment_state.get("completed_cycle_count")
+            == completed_cycles
+        )
+        candidates.append(
+            (
+                progress,
+                path.resolve(),
+                sha256_file(path),
+                is_augmented_cycle_checkpoint,
+            )
+        )
     if not candidates:
         return None
     maximum = max(item[0] for item in candidates)
     winners = [item for item in candidates if item[0] == maximum]
     unique_hashes = {item[2] for item in winners}
     if len(unique_hashes) != 1:
+        augmented = [item for item in winners if item[3]]
+        if len({item[2] for item in augmented}) == 1:
+            return sorted((item[1] for item in augmented), key=str)[0]
         raise ValueError(
             "Ambiguous latest checkpoints share progress but differ in content"
         )

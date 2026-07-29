@@ -379,7 +379,130 @@ def _load_completed_probe_summaries(checkpoint_payload: dict[str, Any]) -> list[
     summaries = state.get("completed_probe_summaries", [])
     if not isinstance(summaries, list):
         raise ValueError("Checkpoint experiment probe summaries are invalid")
-    return list(summaries)
+    result = list(summaries)
+    for cycle_index, summary in enumerate(result):
+        if (
+            not isinstance(summary, dict)
+            or summary.get("cycle_index") != cycle_index
+            or summary.get("cycle_number") != cycle_index + 1
+        ):
+            raise ValueError(
+                "Checkpoint experiment probe summaries are not contiguous"
+            )
+    return result
+
+
+def _recover_completed_probe_summaries(
+    job_dir: Path,
+    checkpoint_payload: dict[str, Any] | None,
+    *,
+    expected_config_sha256: str,
+    completed_cycle_count: int,
+) -> list[dict[str, Any]]:
+    candidates: list[list[dict[str, Any]]] = []
+    if checkpoint_payload is not None:
+        candidates.append(_load_completed_probe_summaries(checkpoint_payload))
+    checkpoint_dir = job_dir / "checkpoints"
+    for path in sorted(checkpoint_dir.glob("cycle-*-complete.pt")):
+        payload = load_checkpoint(path, map_location="cpu")
+        if payload["config_sha256"] != expected_config_sha256:
+            continue
+        summaries = _load_completed_probe_summaries(payload)
+        state = payload["trainer_state"]
+        cycle_count = int(state["next_task_index"]) // len(
+            PUBLIC_LANGUAGE_ORDER
+        )
+        experiment_state = payload.get("experiment_state")
+        if (
+            state["phase"] != "task_boundary"
+            or int(state["next_task_index"]) % len(PUBLIC_LANGUAGE_ORDER)
+            or not isinstance(experiment_state, dict)
+            or experiment_state.get("completed_cycle_count") != cycle_count
+            or len(summaries) > cycle_count
+        ):
+            raise ValueError(f"Invalid augmented cycle checkpoint: {path}")
+        if cycle_count <= completed_cycle_count:
+            candidates.append(summaries)
+    recovered: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=len):
+        overlap = min(len(recovered), len(candidate))
+        if recovered[:overlap] != candidate[:overlap]:
+            raise ValueError("Completed probe-summary histories disagree")
+        if len(candidate) > len(recovered):
+            recovered = candidate
+    if len(recovered) > completed_cycle_count:
+        raise ValueError("Probe-summary history is beyond continual progress")
+    return recovered
+
+
+def _cycle_boundary_source_checkpoint(
+    job_dir: Path,
+    *,
+    cycle_index: int,
+    expected_config_sha256: str,
+) -> Path:
+    task_index = (cycle_index + 1) * len(PUBLIC_LANGUAGE_ORDER) - 1
+    expected_next_task = task_index + 1
+    canonical = (
+        job_dir
+        / "checkpoints"
+        / f"task-{task_index:04d}-ru-boundary.pt"
+    )
+    paths = [canonical] if canonical.is_file() else []
+    paths.extend(
+        path
+        for path in sorted((job_dir / "checkpoints").glob("*.pt"))
+        if path != canonical and not path.name.startswith("cycle-")
+    )
+    candidates: list[tuple[Path, dict[str, Any], str]] = []
+    for path in paths:
+        payload = load_checkpoint(path, map_location="cpu")
+        state = payload["trainer_state"]
+        tasks = payload["resolved_config"]["tasks"]
+        if (
+            payload["config_sha256"] == expected_config_sha256
+            and state["phase"] == "task_boundary"
+            and int(state["current_task_index"]) == task_index
+            and int(state["next_task_index"]) == expected_next_task
+            and tasks[task_index]["language"] == "ru"
+        ):
+            candidates.append((path.resolve(), payload, sha256_file(path)))
+            if path == canonical:
+                break
+    if not candidates:
+        raise FileNotFoundError(
+            f"Missing raw Russian checkpoint for cycle {cycle_index + 1}"
+        )
+    if len({item[2] for item in candidates}) != 1:
+        raise ValueError(
+            f"Ambiguous raw Russian checkpoints for cycle {cycle_index + 1}"
+        )
+    return candidates[0][0]
+
+
+def _cycle_experiment_state(
+    *,
+    spec: JobSpec,
+    resolved: dict[str, Any],
+    requested_horizon_cycles: int,
+    cycle_index: int,
+    probe_summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "launcher_job_identity": {
+            "job_id": spec.job_id,
+            "public_model": spec.public_model,
+            "internal_variant": spec.internal_variant,
+            "seed": spec.seed,
+        },
+        "scientific_sha256": spec.scientific_sha256,
+        "resolved_experiment_sha256": spec.resolved_sha256,
+        "requested_horizon_cycles": requested_horizon_cycles,
+        "completed_cycle_count": cycle_index + 1,
+        "data_manifest_identities": resolved["data_contract"],
+        "completed_probe_summaries": probe_summaries[: cycle_index + 1],
+    }
 
 
 def _record_cycle_tensorboard(
@@ -562,6 +685,7 @@ def run_resolved_job(
             "requested_horizon_cycles": config.experiment.cycles,
         }
     )
+    metadata["status"] = "running"
     atomic_write_json(metadata_path, metadata)
     event_logger: JsonlMetricLogger | None = None
     controller = StageProcessController()
@@ -703,10 +827,13 @@ def run_resolved_job(
                     }
                 )
                 atomic_write_json(metadata_path, metadata)
-        probe_summaries = (
-            []
-            if checkpoint_payload is None
-            else _load_completed_probe_summaries(checkpoint_payload)
+        probe_summaries = _recover_completed_probe_summaries(
+            job_dir,
+            checkpoint_payload,
+            expected_config_sha256=internal_sha,
+            completed_cycle_count=(
+                completed_tasks // len(PUBLIC_LANGUAGE_ORDER)
+            ),
         )
         if (job_dir / "metrics.jsonl").is_file():
             event_logger = JsonlMetricLogger(job_dir / "metrics.jsonl")
@@ -721,7 +848,173 @@ def run_resolved_job(
                     "resolved_experiment_sha256": spec.resolved_sha256,
                 }
             )
+
+        def ensure_completed_cycles(
+            current_checkpoint: Path,
+            current_payload: dict[str, Any],
+            *,
+            current_completed_tasks: int,
+            recovery: bool,
+            stage_attempt: int | None,
+        ) -> tuple[Path, dict[str, Any]]:
+            nonlocal event_logger
+            completed_cycle_count = current_completed_tasks // len(
+                PUBLIC_LANGUAGE_ORDER
+            )
+            for cycle_index in range(completed_cycle_count):
+                augmented_path = (
+                    job_dir
+                    / "checkpoints"
+                    / f"cycle-{cycle_index + 1:04d}-complete.pt"
+                )
+                source_checkpoint: Path | None = None
+                if config.probe.enabled:
+                    if len(probe_summaries) < cycle_index:
+                        raise ValueError("Probe summary cycle sequence has a gap")
+                    if len(probe_summaries) == cycle_index:
+                        source_checkpoint = _cycle_boundary_source_checkpoint(
+                            job_dir,
+                            cycle_index=cycle_index,
+                            expected_config_sha256=internal_sha,
+                        )
+                        source_sha = sha256_file(source_checkpoint)
+                        probe_result = _run_or_resume_probe(
+                            controller,
+                            config=config,
+                            spec=spec,
+                            cycle_index=cycle_index,
+                            source_checkpoint=source_checkpoint,
+                            source_sha256=source_sha,
+                            world_size=world_size,
+                            rendezvous_port=(
+                                rendezvous_port + cycle_index * 4 + 1
+                            ),
+                            environment=environment,
+                        )
+                        probe_summary = _probe_summary(
+                            probe_result,
+                            public_model=spec.public_model,
+                            cycle_index=cycle_index,
+                        )
+                        probe_summary["probe_results_path"] = str(
+                            job_dir
+                            / "probes"
+                            / f"cycle-{cycle_index + 1:04d}"
+                            / "probe_results.json"
+                        )
+                        probe_summaries.append(probe_summary)
+                    summary = probe_summaries[cycle_index]
+                    source_before = summary.get(
+                        "source_checkpoint_sha256_before"
+                    )
+                    if (
+                        summary.get("cycle_index") != cycle_index
+                        or summary.get("cycle_number") != cycle_index + 1
+                        or not isinstance(source_before, str)
+                        or len(source_before) != 64
+                        or summary.get("source_checkpoint_sha256_after")
+                        != source_before
+                    ):
+                        raise ValueError(
+                            f"Stored probe identity is invalid for cycle {cycle_index + 1}"
+                        )
+                expected_experiment_state = _cycle_experiment_state(
+                    spec=spec,
+                    resolved=resolved,
+                    requested_horizon_cycles=config.experiment.cycles,
+                    cycle_index=cycle_index,
+                    probe_summaries=probe_summaries,
+                )
+                created = False
+                if augmented_path.is_file():
+                    augmented_payload = load_checkpoint(
+                        augmented_path, map_location="cpu"
+                    )
+                    augmented_state = augmented_payload["trainer_state"]
+                    if (
+                        augmented_payload["config_sha256"] != internal_sha
+                        or augmented_state["phase"] != "task_boundary"
+                        or int(augmented_state["next_task_index"])
+                        != (cycle_index + 1) * len(PUBLIC_LANGUAGE_ORDER)
+                        or augmented_payload.get("experiment_state")
+                        != expected_experiment_state
+                    ):
+                        raise ValueError(
+                            "Existing augmented cycle checkpoint differs"
+                        )
+                else:
+                    if source_checkpoint is None:
+                        source_checkpoint = _cycle_boundary_source_checkpoint(
+                            job_dir,
+                            cycle_index=cycle_index,
+                            expected_config_sha256=internal_sha,
+                        )
+                    if config.probe.enabled:
+                        summary = probe_summaries[cycle_index]
+                        source_sha = sha256_file(source_checkpoint)
+                        if (
+                            summary["source_checkpoint_sha256_before"]
+                            != source_sha
+                            or Path(summary["source_checkpoint"]).resolve()
+                            != source_checkpoint
+                        ):
+                            raise ValueError(
+                                "Stored probe summary has another Russian source"
+                            )
+                    checkpoint_string, _ = augment_cycle_checkpoint(
+                        source_checkpoint,
+                        output_path=augmented_path,
+                        experiment_state=expected_experiment_state,
+                    )
+                    augmented_path = Path(checkpoint_string)
+                    augmented_payload = load_checkpoint(augmented_path)
+                    created = True
+                boundary_tasks = (cycle_index + 1) * len(
+                    PUBLIC_LANGUAGE_ORDER
+                )
+                if current_completed_tasks == boundary_tasks:
+                    current_checkpoint = augmented_path
+                    current_payload = augmented_payload
+                    pointer = pointer_for_checkpoint(
+                        current_checkpoint,
+                        job_dir=job_dir,
+                        scientific_sha256=spec.scientific_sha256,
+                        resolved_experiment_sha256=spec.resolved_sha256,
+                        requested_horizon_cycles=config.experiment.cycles,
+                    )
+                    write_latest_pointer(job_dir, pointer)
+                if created:
+                    _record_cycle_tensorboard(
+                        config, job_dir, probe_summaries[: cycle_index + 1]
+                    )
+                    if event_logger is None:
+                        event_logger = JsonlMetricLogger(
+                            job_dir / "metrics.jsonl"
+                        )
+                    event_logger.log(
+                        {
+                            "event": "cycle_complete",
+                            "cycle_index": cycle_index,
+                            "completed_tasks": boundary_tasks,
+                            "checkpoint_path": str(augmented_path),
+                            "checkpoint_sha256": sha256_file(
+                                augmented_path
+                            ),
+                            "stage_attempt": stage_attempt,
+                            "recovered_probe_backfill": recovery,
+                        }
+                    )
+            return current_checkpoint, current_payload
+
         total_tasks = len(continual.tasks)
+        if checkpoint is not None and checkpoint_payload is not None:
+            checkpoint, checkpoint_payload = ensure_completed_cycles(
+                checkpoint,
+                checkpoint_payload,
+                current_completed_tasks=completed_tasks,
+                recovery=True,
+                stage_attempt=None,
+            )
         while completed_tasks < total_tasks:
             target_boundary = min(
                 ((completed_tasks // len(PUBLIC_LANGUAGE_ORDER)) + 1)
@@ -752,92 +1045,12 @@ def run_resolved_job(
             ):
                 raise ValueError("Continual stage did not reach its cycle boundary")
             completed_tasks = target_boundary
-            source_sha = sha256_file(checkpoint)
-            if config.probe.enabled:
-                probe_result = _run_or_resume_probe(
-                    controller,
-                    config=config,
-                    spec=spec,
-                    cycle_index=cycle_index,
-                    source_checkpoint=checkpoint,
-                    source_sha256=source_sha,
-                    world_size=world_size,
-                    rendezvous_port=rendezvous_port + cycle_index * 4 + 1,
-                    environment=environment,
-                )
-                probe_summary = _probe_summary(
-                    probe_result,
-                    public_model=spec.public_model,
-                    cycle_index=cycle_index,
-                )
-                probe_summary["probe_results_path"] = str(
-                    job_dir
-                    / "probes"
-                    / f"cycle-{cycle_index + 1:04d}"
-                    / "probe_results.json"
-                )
-                if len(probe_summaries) == cycle_index:
-                    probe_summaries.append(probe_summary)
-                elif len(probe_summaries) > cycle_index:
-                    if probe_summaries[cycle_index] != probe_summary:
-                        raise ValueError("Existing cycle probe summary changed")
-                else:
-                    raise ValueError("Probe summary cycle sequence has a gap")
-            experiment_state = {
-                "schema_version": 1,
-                "launcher_job_identity": {
-                    "job_id": spec.job_id,
-                    "public_model": spec.public_model,
-                    "internal_variant": spec.internal_variant,
-                    "seed": spec.seed,
-                },
-                "scientific_sha256": spec.scientific_sha256,
-                "resolved_experiment_sha256": spec.resolved_sha256,
-                "requested_horizon_cycles": config.experiment.cycles,
-                "completed_cycle_count": cycle_index + 1,
-                "data_manifest_identities": resolved["data_contract"],
-                "completed_probe_summaries": probe_summaries,
-            }
-            augmented_path = (
-                job_dir
-                / "checkpoints"
-                / f"cycle-{cycle_index + 1:04d}-complete.pt"
-            )
-            if augmented_path.is_file():
-                existing = load_checkpoint(augmented_path)
-                if existing.get("experiment_state") != experiment_state:
-                    raise ValueError("Existing augmented cycle checkpoint differs")
-                checkpoint = augmented_path
-            else:
-                checkpoint_string, _ = augment_cycle_checkpoint(
-                    checkpoint,
-                    output_path=augmented_path,
-                    experiment_state=experiment_state,
-                )
-                checkpoint = Path(checkpoint_string)
-            checkpoint_payload = load_checkpoint(checkpoint)
-            pointer = pointer_for_checkpoint(
+            checkpoint, checkpoint_payload = ensure_completed_cycles(
                 checkpoint,
-                job_dir=job_dir,
-                scientific_sha256=spec.scientific_sha256,
-                resolved_experiment_sha256=spec.resolved_sha256,
-                requested_horizon_cycles=config.experiment.cycles,
-            )
-            write_latest_pointer(job_dir, pointer)
-            _record_cycle_tensorboard(
-                config, job_dir, probe_summaries
-            )
-            if event_logger is None:
-                event_logger = JsonlMetricLogger(job_dir / "metrics.jsonl")
-            event_logger.log(
-                {
-                    "event": "cycle_complete",
-                    "cycle_index": cycle_index,
-                    "completed_tasks": completed_tasks,
-                    "checkpoint_path": str(checkpoint),
-                    "checkpoint_sha256": pointer["checkpoint_sha256"],
-                    "stage_attempt": stage_attempt,
-                }
+                checkpoint_payload,
+                current_completed_tasks=completed_tasks,
+                recovery=False,
+                stage_attempt=stage_attempt,
             )
 
         assert checkpoint is not None and checkpoint_payload is not None
