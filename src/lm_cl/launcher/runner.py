@@ -17,6 +17,7 @@ import yaml
 from lm_cl.config import save_continual_config
 from lm_cl.data.storage import atomic_write_json
 from lm_cl.environment import inspect_environment
+from lm_cl.launcher.acceptance import validate_completion_invariants
 from lm_cl.launcher.config import config_from_mapping
 from lm_cl.launcher.jobs import (
     JobSpec,
@@ -25,7 +26,11 @@ from lm_cl.launcher.jobs import (
     save_internal_continual_config,
     save_internal_probe_config,
 )
-from lm_cl.launcher.schema import PUBLIC_LANGUAGE_ORDER
+from lm_cl.launcher.schema import (
+    MEMORY_INTERNAL_VARIANTS,
+    PUBLIC_LANGUAGE_ORDER,
+    PUBLIC_MODEL_VARIANTS,
+)
 from lm_cl.launcher.state import (
     augment_cycle_checkpoint,
     discover_unambiguous_latest_checkpoint,
@@ -397,11 +402,55 @@ def _run_or_resume_probe(
 def _probe_summary(
     result: dict[str, Any], *, public_model: str, cycle_index: int
 ) -> dict[str, Any]:
-    mode = "carried" if public_model == "fastmem_rmt" else "not_applicable"
+    internal_variant = PUBLIC_MODEL_VARIANTS[public_model]
+    memory_enabled = internal_variant in MEMORY_INTERNAL_VARIANTS
+    mode = "carried" if memory_enabled else "not_applicable"
     curves = result["auc_report"]["curves"]
     if mode not in curves:
         raise ValueError(f"Primary probe curve {mode} is missing")
     curve = curves[mode]
+    records_by_mode = {
+        candidate_mode: [
+            item
+            for item in result["curve_records"]
+            if item["memory_evaluation_mode"] == candidate_mode
+        ]
+        for candidate_mode in sorted(curves)
+    }
+    record_modes = {
+        item["memory_evaluation_mode"] for item in result["curve_records"]
+    }
+    if record_modes != set(curves):
+        raise ValueError("Probe curve records and AUC modes disagree")
+    reset_carried_max_abs_ce_difference = None
+    if memory_enabled:
+        if set(records_by_mode) != {"reset", "carried"}:
+            raise ValueError(
+                "Memory probe must contain reset and carried curves"
+            )
+        reset = records_by_mode["reset"]
+        carried = records_by_mode["carried"]
+        if len(reset) != len(carried):
+            raise ValueError("Reset/carried probe curves have different lengths")
+        differences = []
+        for reset_item, carried_item in zip(reset, carried):
+            reset_coordinate = (
+                reset_item["probe_logical_step"],
+                reset_item["cumulative_input_tokens"],
+            )
+            carried_coordinate = (
+                carried_item["probe_logical_step"],
+                carried_item["cumulative_input_tokens"],
+            )
+            if reset_coordinate != carried_coordinate:
+                raise ValueError("Reset/carried probe coordinates differ")
+            differences.append(
+                abs(
+                    float(reset_item["mean_validation_ce"])
+                    - float(carried_item["mean_validation_ce"])
+                )
+            )
+        reset_carried_max_abs_ce_difference = max(differences, default=0.0)
     return {
         "cycle_index": cycle_index,
         "cycle_number": cycle_index + 1,
@@ -412,6 +461,10 @@ def _probe_summary(
             for item in result["curve_records"]
             if item["memory_evaluation_mode"] == mode
         ],
+        "validation_curves_by_memory_mode": records_by_mode,
+        "reset_carried_max_abs_ce_difference": (
+            reset_carried_max_abs_ce_difference
+        ),
         "final_validation_ce": curve["final_validation_ce"],
         "normalized_token_auc": curve[
             "primary_normalized_trapezoidal_auc"
@@ -674,7 +727,7 @@ def _summary(
             "metric": "mean_validation_ce_from_best_v1",
             "memory_evaluation_mode": (
                 "reset"
-                if spec.internal_variant == "fastmem_rmt"
+                if spec.internal_variant in MEMORY_INTERNAL_VARIANTS
                 else "not_applicable"
             ),
             "evaluation_count": state.get(
@@ -704,6 +757,13 @@ def _summary(
                 Path(spec.output_dir) / "metrics.jsonl"
             ),
         }
+    completion_invariants = validate_completion_invariants(
+        config,
+        internal_variant=spec.internal_variant,
+        state=state,
+        probe_summaries=probe_rows,
+        resolved_variant=payload["resolved_config"]["variant"],
+    )
     return {
         "summary_schema_version": 1,
         "status": "complete",
@@ -727,6 +787,7 @@ def _summary(
             item["final_validation_ce"] for item in probe_rows
         ],
         "final_forgetting": final_forgetting,
+        "completion_invariants": completion_invariants,
         "failure_history": metadata["failure_history"],
         "resume_history": metadata["resume_history"],
         "environment_identity": inspect_environment(),

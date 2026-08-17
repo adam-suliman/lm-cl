@@ -39,6 +39,7 @@ def build_release(output: Path) -> dict[str, object]:
         "inspect_environment.py",
         "inspect_manifest.py",
         "inspect_tokenizer.py",
+        "compare_control_experiments.py",
         "launch_experiments.py",
         "materialize_stage.py",
         "prepare_experiment_data.py",
@@ -55,6 +56,8 @@ def build_release(output: Path) -> dict[str, object]:
         _copy_file(path, output / path.relative_to(ROOT))
     for name in (
         "zyphra_fastmem_a100.yaml",
+        "zyphra_controls_a100_40gb_5m_5cycle_1b.yaml",
+        "zyphra_controls_a100_80gb_5m_5cycle_1b.yaml",
         "zyphra_fastmem_two_cycle_smoke.yaml",
     ):
         _copy_file(
@@ -79,7 +82,11 @@ def build_release(output: Path) -> dict[str, object]:
         else ROOT / "docs"
     )
     _copy_file(release_readme, output / "README.md")
-    for name in ("CONFIGURATION.md", "DATA_AND_RESUME.md"):
+    for name in (
+        "CONFIGURATION.md",
+        "DATA_AND_RESUME.md",
+        "A100_CONTROLS.md",
+    ):
         _copy_file(
             release_docs / name,
             output / "docs" / name,
@@ -134,7 +141,7 @@ def build_release(output: Path) -> dict[str, object]:
                 "sha256": _sha256(path),
             }
         )
-    if len(markdown) > 3:
+    if len(markdown) > 4:
         raise ValueError(f"Release contains excessive Markdown: {markdown}")
     return {
         "release_schema_version": 1,

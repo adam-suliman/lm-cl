@@ -5,7 +5,7 @@ experiment:
   output_root: runs/final-deliverable/smoke-results
   repository_root: ../..
   seed: [99101]
-  models: [transformer, fastmem_rmt]
+  models: [transformer, backbone_matched_k, fastmem_rmt_zero, fastmem_rmt]
   model_size: tiny
   cycles: 2
   tokens_per_task: 32

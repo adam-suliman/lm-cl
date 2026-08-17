@@ -171,12 +171,26 @@ def _variant(config: LauncherConfig, public_model: str) -> VariantConfig:
             slow_update_period_k=1,
             fast_memory_grad_clip_norm=None,
         )
-    elif public_model == "fastmem_rmt":
+    elif public_model == "backbone_matched_k":
         variant = VariantConfig(
-            name="fastmem_rmt",
+            name="backbone_matched_k",
+            memory_enabled=False,
+            persistent_fast_memory=False,
+            fast_lr=0.0,
+            memory_tokens=0,
+            slow_update_period_k=config.fastmem.slow_accumulation_k,
+            fast_memory_grad_clip_norm=None,
+        )
+    elif public_model in {"fastmem_rmt_zero", "fastmem_rmt"}:
+        variant = VariantConfig(
+            name=public_model,
             memory_enabled=True,
             persistent_fast_memory=True,
-            fast_lr=config.fastmem.fast_lr,
+            fast_lr=(
+                0.0
+                if public_model == "fastmem_rmt_zero"
+                else config.fastmem.fast_lr
+            ),
             memory_tokens=config.fastmem.memory_tokens,
             slow_update_period_k=config.fastmem.slow_accumulation_k,
             fast_memory_grad_clip_norm=config.fastmem.fast_clip,

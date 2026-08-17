@@ -204,6 +204,10 @@ def apply_launcher_overrides(
         "gpus_per_job": ("launcher", "gpus_per_job"),
         "output_root": ("experiment", "output_root"),
         "precision": ("training", "precision"),
+        "physical_microbatch_sequences": (
+            "training",
+            "physical_microbatch_sequences",
+        ),
         "resume": ("experiment", "resume"),
         "probe_enabled": ("probe", "enabled"),
     }

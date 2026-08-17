@@ -19,8 +19,13 @@ PUBLIC_LANGUAGE_ORDER = (
 )
 PUBLIC_MODEL_VARIANTS = {
     "transformer": "backbone_clean",
+    "backbone_matched_k": "backbone_matched_k",
+    "fastmem_rmt_zero": "fastmem_rmt_zero",
     "fastmem_rmt": "fastmem_rmt",
 }
+MEMORY_INTERNAL_VARIANTS = frozenset(
+    {"base_rmt", "fastmem_rmt_zero", "fastmem_rmt"}
+)
 TOKEN_BUDGET_POLICY = "floor_complete_sequences_v1"
 CYCLE_MANIFEST_POLICY = "fresh_disjoint_v1"
 WINDOWED_CYCLE_MANIFEST_POLICY = "disjoint_sequence_windows_v1"
@@ -128,7 +133,8 @@ class ExperimentSettings:
         invalid_models = sorted(set(self.models) - set(PUBLIC_MODEL_VARIANTS))
         if invalid_models:
             raise ValueError(
-                "Only transformer and fastmem_rmt are public model names; "
+                "Unknown public model names; allowed="
+                f"{sorted(PUBLIC_MODEL_VARIANTS)}, "
                 f"invalid={invalid_models}"
             )
         seeds = self.seeds

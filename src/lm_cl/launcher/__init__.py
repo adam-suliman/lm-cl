@@ -6,6 +6,7 @@ from lm_cl.launcher.config import (
     load_launcher_config,
 )
 from lm_cl.launcher.schema import (
+    MEMORY_INTERNAL_VARIANTS,
     PUBLIC_LANGUAGE_ORDER,
     PUBLIC_MODEL_VARIANTS,
     TokenBudget,
@@ -14,6 +15,7 @@ from lm_cl.launcher.schema import (
 
 __all__ = [
     "LauncherConfig",
+    "MEMORY_INTERNAL_VARIANTS",
     "PUBLIC_LANGUAGE_ORDER",
     "PUBLIC_MODEL_VARIANTS",
     "TokenBudget",

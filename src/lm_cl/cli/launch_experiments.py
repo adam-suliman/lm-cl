@@ -47,6 +47,15 @@ def command() -> None:
     parser.add_argument("--gpus-per-job", type=int, default=None)
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"])
+    parser.add_argument(
+        "--physical-microbatch-sequences",
+        type=int,
+        default=None,
+        help=(
+            "per-rank execution microbatch override; changing it makes "
+            "an existing run non-resumable"
+        ),
+    )
     parser.add_argument("--resume", choices=["never", "auto", "required"])
     probe_group = parser.add_mutually_exclusive_group()
     probe_group.add_argument("--probe", dest="probe_enabled", action="store_true")
@@ -72,6 +81,9 @@ def command() -> None:
         "gpus_per_job": args.gpus_per_job,
         "output_root": args.output_root,
         "precision": args.precision,
+        "physical_microbatch_sequences": (
+            args.physical_microbatch_sequences
+        ),
         "resume": args.resume,
         "probe_enabled": args.probe_enabled,
     }

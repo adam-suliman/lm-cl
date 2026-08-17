@@ -1,10 +1,13 @@
 # FastMem-RMT continual language learning
 
 This package runs one portable Zyphra-style continual-language experiment with
-exactly two public model names:
+four public model names:
 
 - `transformer`, mapped to the approved `backbone_clean` baseline (AdamW after
   every logical batch, K=1);
+- `backbone_matched_k`, the same no-memory backbone with K=2 slow updates;
+- `fastmem_rmt_zero`, the exact persistent FastMem-RMT path with K=2 and
+  `fast_lr=0`;
 - `fastmem_rmt`, the approved one-pass FastMem-RMT realization with eight
   memory vectors, two 1,024-token segments, K=2, fast LR 0.005 by default,
   active-memory-only clipping at 1.0, task-boundary reset from learned M0, and
@@ -13,10 +16,13 @@ exactly two public model names:
 The language order is always `en → zh_written → fr → ja → es → de → pt → ru`.
 The full-budget preset uses a distinct packed CulturaX stage for every repeated
 appearance. The explicitly labelled scaled-budget preset instead uses five
-non-overlapping 1B sequence windows from each frozen cycle-0 5B stage. The primary
-cycle-end Vietnamese probe is `system`: the Transformer reports its ordinary
-curve; FastMem reports carried-memory full-system plasticity while retaining
-the reset curve as a diagnostic.
+non-overlapping 1B sequence windows from each frozen cycle-0 5B stage. The
+primary cycle-end Vietnamese probe is `system`: no-memory variants report an
+ordinary curve; memory variants report carried-memory full-system plasticity
+while retaining the reset curve as a diagnostic.
+
+For the two immediate 5M A100 causal controls and exact one-GPU/multi-GPU
+commands, follow [A100_CONTROLS.md](docs/A100_CONTROLS.md).
 
 ## Install
 
@@ -101,7 +107,7 @@ Preparation uses pinned `uonlp/CulturaX` revision
 global overlap registry. Training is offline after all manifests validate.
 See [DATA_AND_RESUME.md](docs/DATA_AND_RESUME.md) before allocating storage.
 
-## Launch two complete experiments
+## Launch complete experiments
 
 ```bash
 python -m lm_cl.cli.inspect_environment \
@@ -246,8 +252,8 @@ Each job writes `resolved_experiment.yaml`, `job_metadata.json`,
 also contains `jobs.jsonl`, `summary.json`, and `summary.csv`.
 
 The bundled two-cycle smoke uses a tiny CPU model and synthetic tokens while
-exercising both public variants, all eight language names twice, two probes,
-checkpointing, TensorBoard, and summaries:
+exercising all four public variants, all eight language names twice, two
+probes, checkpointing, TensorBoard, and summaries:
 
 ```bash
 python -m lm_cl.cli.launch_experiments \

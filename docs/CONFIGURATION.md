@@ -5,10 +5,11 @@ and recorded in each resolved job configuration and SHA-256.
 
 ## Experiment
 
-`models` accepts only `transformer` and `fastmem_rmt`. `model_size` is `5m` or
-`12m` for production; `tiny` is restricted to functional synthetic smoke
-tests. `languages` and `probe_schedule: cycle_end_after_ru` are fixed.
-`resume` is `never`, `auto`, or `required`.
+`models` accepts `transformer`, `backbone_matched_k`, `fastmem_rmt_zero`, and
+`fastmem_rmt`. `model_size` is `5m` or `12m` for production; `tiny` is
+restricted to functional synthetic smoke tests. `languages` and
+`probe_schedule: cycle_end_after_ru` are fixed. `resume` is `never`, `auto`,
+or `required`.
 
 The production architecture files preserve the approved counts:
 
@@ -83,9 +84,11 @@ ID 151,643. The final eleven embedding rows are unused padding.
 Production uses explicit FP32, FP16, or BF16. FP16 uses conditioning multiplier
 2. The release never infers a different precision. AdamW is fixed to betas
 (0.9, 0.95), epsilon 1e-8, weight decay 0.1, and five-percent task-local
-warm-up. The Transformer steps every logical batch. FastMem averages slow
-gradients over K=2, flushes a normalized tail, and advances its scheduler only
-when AdamW steps.
+warm-up. The Transformer steps every logical batch. `backbone_matched_k` and
+both FastMem variants average slow gradients over K=2, flush a normalized
+tail, and advance the scheduler only when AdamW steps. `fastmem_rmt_zero` uses
+the same persistent state transitions and records one explicit transition per
+logical batch, but its configured fast LR is exactly zero.
 
 FastMem memory vectors are direct hidden states. They receive no token,
 absolute-position, type, or role embeddings. Text retains positions 0…2047.
@@ -94,6 +97,11 @@ is a slow parameter. The explicit update is one-pass, target-normalized,
 active-only clipped, detached, and synchronized once per global logical batch.
 An explicit non-default positive `fastmem.fast_lr` is recorded as an ablation;
 the release preset is 0.005.
+
+The launcher accepts `--physical-microbatch-sequences` as a per-rank execution
+override. Global logical-batch and target-normalization semantics do not
+change, but the value is recorded in the run identity; changing it cannot
+resume an existing run.
 
 ## Launcher and tracking
 

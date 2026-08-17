@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,9 +14,11 @@ import numpy as np
 import pytest
 import torch
 
+from lm_cl.analysis.controls import build_control_comparison
 from lm_cl.launcher.config import load_launcher_config
 from lm_cl.launcher.data import resolve_data_contract
 from lm_cl.launcher import data as launcher_data
+from lm_cl.launcher import jobs as launcher_jobs
 from lm_cl.launcher.jobs import (
     build_continual_job_config,
     build_probe_job_config,
@@ -24,6 +26,7 @@ from lm_cl.launcher.jobs import (
     write_resolved_job,
 )
 from lm_cl.launcher import runner as launcher_runner
+from lm_cl.launcher.acceptance import validate_completion_invariants
 from lm_cl.launcher.runner import StageProcessController
 from lm_cl.launcher.scheduler import (
     JobAssignment,
@@ -103,19 +106,175 @@ def _jobs(config):
 def test_public_model_names_map_to_approved_variants():
     assert PUBLIC_MODEL_VARIANTS == {
         "transformer": "backbone_clean",
+        "backbone_matched_k": "backbone_matched_k",
+        "fastmem_rmt_zero": "fastmem_rmt_zero",
         "fastmem_rmt": "fastmem_rmt",
     }
 
 
-def test_release_rejects_internal_variant_names(tmp_path):
+def test_release_rejects_unexposed_variant_names(tmp_path):
     config = _config(tmp_path)
     bad = replace(
         config,
-        experiment=replace(config.experiment, models=["backbone_matched_k"]),
+        experiment=replace(config.experiment, models=["base_rmt"]),
     )
-    with pytest.raises(ValueError, match="Only transformer and fastmem_rmt"):
+    with pytest.raises(ValueError, match="Unknown public model names"):
         bad.validate()
 
+
+@pytest.mark.parametrize(
+    ("public_model", "expected"),
+    [
+        (
+            "backbone_matched_k",
+            {
+                "name": "backbone_matched_k",
+                "memory_enabled": False,
+                "persistent_fast_memory": False,
+                "fast_lr": 0.0,
+                "memory_tokens": 0,
+                "slow_update_period_k": 2,
+            },
+        ),
+        (
+            "fastmem_rmt_zero",
+            {
+                "name": "fastmem_rmt_zero",
+                "memory_enabled": True,
+                "persistent_fast_memory": True,
+                "fast_lr": 0.0,
+                "memory_tokens": 8,
+                "slow_update_period_k": 2,
+            },
+        ),
+    ],
+)
+def test_control_variants_resolve_to_approved_semantics(
+    tmp_path, public_model, expected
+):
+    config = _config(tmp_path, models=[public_model], cycles=1)
+    _, jobs = _jobs(config)
+    continual = build_continual_job_config(config, jobs[0])
+    for field, value in expected.items():
+        assert getattr(continual.variant, field) == value
+    if public_model == "fastmem_rmt_zero":
+        assert continual.variant.fast_memory_grad_clip_norm == 1.0
+
+
+def test_physical_microbatch_cli_override_is_validated(tmp_path):
+    config = load_launcher_config(
+        SMOKE,
+        overrides={
+            "name": "microbatch-override",
+            "models": ["backbone_matched_k"],
+            "physical_microbatch_sequences": 1,
+            "output_root": str(tmp_path),
+        },
+    )
+    assert config.training.physical_microbatch_sequences == 1
+
+
+def test_a100_control_presets_reuse_exact_five_cycle_data_contract(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LM_CL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("LM_CL_OUTPUT_ROOT", str(tmp_path / "output"))
+    baseline = load_launcher_config(
+        ROOT
+        / "configs/experiments/zyphra_fastmem_h100_5m_5cycle_1b.yaml"
+    )
+    expected_microbatches = {"80gb": 12, "40gb": 4}
+    for memory_label, expected_microbatch in expected_microbatches.items():
+        control = load_launcher_config(
+            ROOT
+            / (
+                "configs/experiments/"
+                f"zyphra_controls_a100_{memory_label}_5m_5cycle_1b.yaml"
+            )
+        )
+        assert control.experiment.models == [
+            "backbone_matched_k",
+            "fastmem_rmt_zero",
+        ]
+        assert control.experiment.seeds == [81010]
+        assert control.experiment.cycles == 5
+        assert control.experiment.tokens_per_task == 1_000_000_000
+        assert asdict(control.data) == asdict(baseline.data)
+        assert asdict(control.fastmem) == asdict(baseline.fastmem)
+        assert asdict(control.probe) == asdict(baseline.probe)
+        assert asdict(control.forgetting) == asdict(baseline.forgetting)
+        assert control.training.physical_microbatch_sequences == (
+            expected_microbatch
+        )
+        baseline_training = asdict(baseline.training)
+        control_training = asdict(control.training)
+        baseline_training.pop("physical_microbatch_sequences")
+        control_training.pop("physical_microbatch_sequences")
+        assert control_training == baseline_training
+
+
+@pytest.mark.parametrize(
+    ("public_model", "slow_updates", "fast_updates", "memory_resets"),
+    [
+        ("backbone_matched_k", 38_160, 0, 0),
+        ("fastmem_rmt_zero", 38_160, 76_320, 40),
+    ],
+)
+def test_five_cycle_a100_completion_contract_has_exact_counts(
+    monkeypatch,
+    tmp_path,
+    public_model,
+    slow_updates,
+    fast_updates,
+    memory_resets,
+):
+    monkeypatch.setenv("LM_CL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("LM_CL_OUTPUT_ROOT", str(tmp_path / "output"))
+    config = load_launcher_config(
+        ROOT
+        / "configs/experiments/zyphra_controls_a100_80gb_5m_5cycle_1b.yaml"
+    )
+    is_memory = public_model == "fastmem_rmt_zero"
+    probe_summaries = [
+        {
+            "cycle_index": cycle_index,
+            "primary_memory_evaluation_mode": (
+                "carried" if is_memory else "not_applicable"
+            ),
+            "auc_report": {
+                "curves": (
+                    {"reset": {}, "carried": {}}
+                    if is_memory
+                    else {"not_applicable": {}}
+                )
+            },
+        }
+        for cycle_index in range(5)
+    ]
+    state = {
+        "phase": "task_boundary",
+        "next_task_index": 40,
+        "global_logical_batches": 76_320,
+        "global_input_tokens": 39_999_979_520,
+        "global_valid_targets": 39_980_448_280,
+        "global_slow_steps": slow_updates,
+        "global_fast_updates": fast_updates,
+        "memory_reset_count": memory_resets,
+        "forgetting_evaluation_count": 40,
+    }
+    variant = launcher_jobs._variant(config, public_model)
+    report = validate_completion_invariants(
+        config,
+        internal_variant=variant.name,
+        state=state,
+        probe_summaries=probe_summaries,
+        resolved_variant=asdict(variant),
+    )
+    assert report["status"] == "valid"
+    assert report["expected"]["logical_batches_per_task"] == 1_908
+    assert report["expected"]["total_logical_batches"] == 76_320
+    assert report["expected"]["total_slow_updates"] == slow_updates
+    assert report["expected"]["total_fast_updates"] == fast_updates
 
 def test_models_times_seeds_expand_to_complete_jobs(tmp_path):
     config = _config(tmp_path, seeds=[11, 12])
@@ -528,6 +687,30 @@ def test_multi_gpu_groups_are_disjoint(tmp_path):
     assert set(assignments[0].gpu_ids).isdisjoint(assignments[1].gpu_ids)
 
 
+def test_control_jobs_map_to_documented_one_and_two_gpu_scenarios(tmp_path):
+    base = _config(
+        tmp_path,
+        models=["backbone_matched_k", "fastmem_rmt_zero"],
+        cycles=1,
+    )
+    one_each = _cuda_launcher(base, gpu_ids=[0, 1], gpus_per_job=1)
+    _, one_each_jobs = _jobs(one_each)
+    one_each_assignments = allocate_job_slots(one_each, one_each_jobs)
+    assert [item.gpu_ids for item in one_each_assignments] == [[0], [1]]
+    assert [item.slot_index for item in one_each_assignments] == [0, 1]
+
+    both_per_job = _cuda_launcher(base, gpu_ids=[0, 1], gpus_per_job=2)
+    _, both_per_job_jobs = _jobs(both_per_job)
+    both_per_job_assignments = allocate_job_slots(
+        both_per_job, both_per_job_jobs
+    )
+    assert [item.gpu_ids for item in both_per_job_assignments] == [
+        [0, 1],
+        [0, 1],
+    ]
+    assert [item.slot_index for item in both_per_job_assignments] == [0, 0]
+
+
 def test_impossible_gpu_group_fails(tmp_path):
     config = _config(tmp_path)
     bad = replace(
@@ -723,7 +906,12 @@ def test_tensorboard_resume_deduplicates_steps(tmp_path):
 def tiny_runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("public-tiny-runs")
     results = {}
-    for public_model in ("transformer", "fastmem_rmt"):
+    for public_model in (
+        "transformer",
+        "backbone_matched_k",
+        "fastmem_rmt_zero",
+        "fastmem_rmt",
+    ):
         config = _config(
             root,
             name=f"tiny-{public_model}",
@@ -763,6 +951,124 @@ def test_fastmem_resets_at_every_language(tiny_runs):
     _, _, _, _, result = tiny_runs["fastmem_rmt"]
     assert result.state["memory_reset_count"] == 8
     assert result.state["global_fast_updates"] == 16
+
+
+def test_control_variants_have_expected_update_counts(tiny_runs):
+    _, _, _, matched_config, matched_result = tiny_runs[
+        "backbone_matched_k"
+    ]
+    assert matched_config.variant.slow_update_period_k == 2
+    assert matched_result.state["global_logical_batches"] == 16
+    assert matched_result.state["global_slow_steps"] == 8
+    assert matched_result.state["global_fast_updates"] == 0
+    assert matched_result.state["memory_reset_count"] == 0
+
+    _, _, _, zero_config, zero_result = tiny_runs["fastmem_rmt_zero"]
+    assert zero_config.variant.fast_lr == 0.0
+    assert zero_result.state["global_logical_batches"] == 16
+    assert zero_result.state["global_slow_steps"] == 8
+    assert zero_result.state["global_fast_updates"] == 16
+    assert zero_result.state["memory_reset_count"] == 8
+
+
+@pytest.mark.parametrize(
+    "public_model",
+    [
+        "transformer",
+        "backbone_matched_k",
+        "fastmem_rmt_zero",
+        "fastmem_rmt",
+    ],
+)
+def test_completion_gate_accepts_exact_control_counters(
+    tiny_runs, public_model
+):
+    config, _, spec, continual, result = tiny_runs[public_model]
+    without_probe = replace(
+        config,
+        probe=replace(config.probe, enabled=False),
+    )
+    report = validate_completion_invariants(
+        without_probe,
+        internal_variant=spec.internal_variant,
+        state=result.state,
+        probe_summaries=[],
+        resolved_variant=asdict(continual.variant),
+    )
+    assert report["status"] == "valid"
+    assert report["actual"]["total_logical_batches"] == 16
+    if public_model in {"fastmem_rmt_zero", "fastmem_rmt"}:
+        assert report["actual"]["total_fast_updates"] == 16
+
+
+def test_completion_gate_rejects_tampered_update_count(tiny_runs):
+    config, _, spec, continual, result = tiny_runs["fastmem_rmt_zero"]
+    without_probe = replace(
+        config,
+        probe=replace(config.probe, enabled=False),
+    )
+    state = dict(result.state)
+    state["global_fast_updates"] -= 1
+    with pytest.raises(ValueError, match="total_fast_updates"):
+        validate_completion_invariants(
+            without_probe,
+            internal_variant=spec.internal_variant,
+            state=state,
+            probe_summaries=[],
+            resolved_variant=asdict(continual.variant),
+        )
+
+
+def test_fastmem_zero_probe_summary_preserves_reset_and_carried():
+    def curve(final_ce):
+        return {
+            "step_0_validation_ce": 2.0,
+            "final_validation_ce": final_ce,
+            "primary_normalized_trapezoidal_auc": 1.5,
+            "raw_input_token_trapezoidal_auc": 3.0,
+            "raw_step_trapezoidal_auc": 1.5,
+            "arithmetic_mean_recorded_validation_ce": 1.5,
+        }
+
+    records = []
+    for step, tokens, reset_ce, carried_ce in (
+        (0, 0, 2.0, 2.0),
+        (1, 16, 1.2, 1.1),
+    ):
+        for mode, ce in (("reset", reset_ce), ("carried", carried_ce)):
+            records.append(
+                {
+                    "memory_evaluation_mode": mode,
+                    "probe_logical_step": step,
+                    "cumulative_input_tokens": tokens,
+                    "mean_validation_ce": ce,
+                }
+            )
+    result = {
+        "source_checkpoint": {"path": "/tmp/source.pt", "sha256": "a" * 64},
+        "source_checkpoint_sha256_before": "a" * 64,
+        "source_checkpoint_sha256_after": "a" * 64,
+        "auc_report": {
+            "curves": {
+                "reset": curve(1.2),
+                "carried": curve(1.1),
+            }
+        },
+        "curve_records": records,
+    }
+    summary = launcher_runner._probe_summary(
+        result,
+        public_model="fastmem_rmt_zero",
+        cycle_index=0,
+    )
+    assert summary["primary_memory_evaluation_mode"] == "carried"
+    assert set(summary["validation_curves_by_memory_mode"]) == {
+        "reset",
+        "carried",
+    }
+    assert summary["reset_carried_max_abs_ce_difference"] == pytest.approx(
+        0.1
+    )
 
 
 def test_task_boundaries_record_seen_language_forgetting_matrix(tmp_path):
@@ -1155,6 +1461,7 @@ def test_retry_backfills_failed_probe_before_training_next_cycle(
             "curve_records": [
                 {
                     "memory_evaluation_mode": "not_applicable",
+                    "probe_logical_step": 0,
                     "cumulative_input_tokens": 0,
                     "mean_validation_ce": 2.0,
                 }
@@ -1315,6 +1622,250 @@ def test_horizon_migration_preserves_all_scientific_state(tiny_runs, tmp_path):
         assert state_digest(before[field]) == state_digest(after[field])
 
 
+def _write_control_summary_fixture(
+    root: Path,
+    *,
+    public_model: str,
+    internal_variant: str,
+    slow_updates: int,
+    fast_updates: int,
+    forgetting: float,
+    auc: float,
+    embedded_gate: bool,
+    physical_microbatch: int,
+    gpu_name: str,
+) -> Path:
+    job = root / public_model / "seed-81010"
+    job.mkdir(parents=True)
+    is_memory = internal_variant in {"fastmem_rmt_zero", "fastmem_rmt"}
+    curves = {
+        "carried": {
+            "primary_normalized_trapezoidal_auc": auc,
+            "final_validation_ce": auc - 0.1,
+        },
+        "reset": {
+            "primary_normalized_trapezoidal_auc": auc + 0.05,
+            "final_validation_ce": auc - 0.05,
+        },
+    } if is_memory else {
+        "not_applicable": {
+            "primary_normalized_trapezoidal_auc": auc,
+            "final_validation_ce": auc - 0.1,
+        }
+    }
+    summary = {
+        "summary_schema_version": 1,
+        "status": "complete",
+        "model": public_model,
+        "internal_variant": internal_variant,
+        "seed": 81010,
+        "cycles_completed": 1,
+        "completed_language_tasks": 8,
+        "total_input_tokens": 32_768,
+        "total_target_tokens": 30_720,
+        "total_logical_batches": 16,
+        "total_slow_updates": slow_updates,
+        "total_fast_updates": fast_updates,
+        "per_cycle_probe_auc": [
+            {
+                "cycle_index": 0,
+                "cycle_number": 1,
+                "primary_memory_evaluation_mode": (
+                    "carried" if is_memory else "not_applicable"
+                ),
+                "normalized_token_auc": auc,
+                "final_validation_ce": auc - 0.1,
+                "auc_report": {"curves": curves},
+                "reset_carried_max_abs_ce_difference": (
+                    0.05 if is_memory else None
+                ),
+            }
+        ],
+        "final_forgetting": {
+            "evaluation_count": 8,
+            "average_forgetting_from_best_ce": forgetting,
+            "average_prior_language_forgetting_from_best_ce": (
+                forgetting + 0.1
+            ),
+        },
+        "data_manifest_identities": {
+            "manifest_path": f"/machine/{public_model}/manifest.json",
+            "manifest_content_sha256": "1" * 64,
+            "ordered_data_sha256": "2" * 64,
+        },
+        "gpu_identity": [
+            {
+                "name": gpu_name,
+                "compute_capability": "9.0" if "H100" in gpu_name else "8.0",
+                "total_memory_bytes": 80_000_000_000,
+            }
+        ],
+        "source_tree_identity": {
+            "commit": "a" * 40 if "H100" in gpu_name else "b" * 40,
+            "dirty": False,
+            "source_tree_sha256": "3" * 64,
+        },
+    }
+    if embedded_gate:
+        summary["completion_invariants"] = {
+            "status": "valid",
+            "actual": {
+                "completed_language_tasks": 8,
+                "total_logical_batches": 16,
+                "total_input_tokens": 32_768,
+                "total_target_tokens": 30_720,
+                "total_slow_updates": slow_updates,
+                "total_fast_updates": fast_updates,
+                "cycle_end_probes": 1,
+                "forgetting_evaluations": 8,
+            },
+        }
+    resolved_sha = canonical_sha256(
+        {"public_model": public_model, "variant": internal_variant}
+    )
+    summary["resolved_experiment_sha256"] = resolved_sha
+    resolved = {
+        "public_model": public_model,
+        "internal_variant": internal_variant,
+        "resolved_experiment_sha256": resolved_sha,
+        "scientific_identity": {
+            "schema": "test-control-v1",
+            "public_model": public_model,
+            "internal_variant": internal_variant,
+            "model_size": "5m",
+            "seed": 81010,
+            "language_order": list(PUBLIC_LANGUAGE_ORDER),
+            "task_token_budget": {"effective_input_tokens": 4096},
+            "sequence_length": 16,
+            "training": {
+                "global_batch_sequences": 2,
+                "physical_microbatch_sequences": physical_microbatch,
+                "precision": "bf16",
+                "peak_lr_5m": 0.003,
+            },
+            "fastmem": {
+                "memory_tokens": 8,
+                "fast_lr": 0.005,
+                "slow_accumulation_k": 2,
+            },
+            "probe": {"enabled": True, "training_tokens": 32},
+            "cycle_manifest_policy": "disjoint_sequence_windows_v1",
+        },
+        "launcher_config": {
+            "training": {
+                "physical_microbatch_sequences": physical_microbatch,
+                "precision": "bf16",
+            },
+            "launcher": {"gpus_per_job": 1},
+        },
+    }
+    summary_path = job / "summary.json"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    (job / "resolved_experiment.yaml").write_text(
+        json.dumps(resolved), encoding="utf-8"
+    )
+    return summary_path
+
+
+def test_control_comparison_validates_legacy_and_gated_summaries(tmp_path):
+    paths = {
+        "transformer": _write_control_summary_fixture(
+            tmp_path,
+            public_model="transformer",
+            internal_variant="backbone_clean",
+            slow_updates=16,
+            fast_updates=0,
+            forgetting=4.0,
+            auc=5.0,
+            embedded_gate=False,
+            physical_microbatch=16,
+            gpu_name="NVIDIA H100",
+        ),
+        "backbone_matched_k": _write_control_summary_fixture(
+            tmp_path,
+            public_model="backbone_matched_k",
+            internal_variant="backbone_matched_k",
+            slow_updates=8,
+            fast_updates=0,
+            forgetting=3.5,
+            auc=4.7,
+            embedded_gate=True,
+            physical_microbatch=4,
+            gpu_name="NVIDIA A100",
+        ),
+        "fastmem_rmt_zero": _write_control_summary_fixture(
+            tmp_path,
+            public_model="fastmem_rmt_zero",
+            internal_variant="fastmem_rmt_zero",
+            slow_updates=8,
+            fast_updates=16,
+            forgetting=3.3,
+            auc=4.5,
+            embedded_gate=True,
+            physical_microbatch=4,
+            gpu_name="NVIDIA A100",
+        ),
+        "fastmem_rmt": _write_control_summary_fixture(
+            tmp_path,
+            public_model="fastmem_rmt",
+            internal_variant="fastmem_rmt",
+            slow_updates=8,
+            fast_updates=16,
+            forgetting=3.0,
+            auc=4.0,
+            embedded_gate=False,
+            physical_microbatch=16,
+            gpu_name="NVIDIA H100",
+        ),
+    }
+    report = build_control_comparison(**paths)
+    assert report["status"] == "valid"
+    assert report["completion_evidence"]["transformer"]["status"] == (
+        "legacy_summary_reconstructed"
+    )
+    assert report["completion_evidence"]["fastmem_rmt_zero"]["status"] == (
+        "embedded_gate_validated"
+    )
+    assert report["contrasts"][
+        "backbone_matched_k_minus_transformer"
+    ]["delta"]["final_average_forgetting_ce"] == pytest.approx(-0.5)
+    assert report["contrasts"][
+        "fastmem_rmt_minus_fastmem_rmt_zero"
+    ]["delta"]["probe_primary_normalized_auc_by_cycle"] == [-0.5]
+    assert any("GPU hardware" in item for item in report["warnings"])
+    assert any("Legacy summaries" in item for item in report["warnings"])
+
+    output_json = tmp_path / "comparison" / "report.json"
+    output_csv = tmp_path / "comparison" / "metrics.csv"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "lm_cl.cli.compare_control_experiments",
+            "--transformer",
+            str(paths["transformer"]),
+            "--backbone-matched-k",
+            str(paths["backbone_matched_k"]),
+            "--fastmem-rmt-zero",
+            str(paths["fastmem_rmt_zero"]),
+            "--fastmem-rmt",
+            str(paths["fastmem_rmt"]),
+            "--output-json",
+            str(output_json),
+            "--output-csv",
+            str(output_csv),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output_json.read_text())["status"] == "valid"
+    csv_rows = output_csv.read_text(encoding="utf-8").splitlines()
+    assert len(csv_rows) == 5
+    assert "probe_normalized_auc_by_mode" in csv_rows[0]
+
+
 def test_release_builder_excludes_internal_artifacts(tmp_path):
     output = tmp_path / "release"
     subprocess.run(
@@ -1329,9 +1880,18 @@ def test_release_builder_excludes_internal_artifacts(tmp_path):
     assert not any("phase8" in path.lower() for path in paths)
     assert sorted(path for path in paths if path.endswith(".md")) == [
         "README.md",
+        "docs/A100_CONTROLS.md",
         "docs/CONFIGURATION.md",
         "docs/DATA_AND_RESUME.md",
     ]
+    assert (
+        output
+        / "configs/experiments/zyphra_controls_a100_40gb_5m_5cycle_1b.yaml"
+    ).is_file()
+    assert (
+        output
+        / "configs/experiments/zyphra_controls_a100_80gb_5m_5cycle_1b.yaml"
+    ).is_file()
 
 
 def test_gitignore_does_not_hide_source_data_package():
@@ -1358,6 +1918,7 @@ def test_exported_release_imports_and_cli_help(tmp_path):
     environment["PYTHONPATH"] = str(output / "src")
     for module in (
         "lm_cl.cli.launch_experiments",
+        "lm_cl.cli.compare_control_experiments",
         "lm_cl.cli.prepare_experiment_data",
         "lm_cl.cli.inspect_environment",
     ):

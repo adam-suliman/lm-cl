@@ -53,6 +53,7 @@ lm-cl-compare-probe-checkpoints = "lm_cl.cli.compare_probe_checkpoints:main"
 lm-cl-validate-probe-data-pair = "lm_cl.cli.validate_probe_data_pair:main"
 lm-cl-prepare-experiment-data = "lm_cl.cli.prepare_experiment_data:main"
 lm-cl-launch-experiments = "lm_cl.cli.launch_experiments:main"
+lm-cl-compare-control-experiments = "lm_cl.cli.compare_control_experiments:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
