@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 tracking = ["tensorboard>=2.15"]
+pipeline = ["psutil>=5.9", "pyarrow>=15", "requests>=2.31"]
 data = [
   "datasets>=3,<5",
   "huggingface-hub>=0.30",
@@ -54,6 +55,8 @@ lm-cl-validate-probe-data-pair = "lm_cl.cli.validate_probe_data_pair:main"
 lm-cl-prepare-experiment-data = "lm_cl.cli.prepare_experiment_data:main"
 lm-cl-launch-experiments = "lm_cl.cli.launch_experiments:main"
 lm-cl-compare-control-experiments = "lm_cl.cli.compare_control_experiments:main"
+lm-cl-a100-run = "lm_cl.cli.a100_run:main"
+lm-cl-calibrate-continual = "lm_cl.cli.calibrate_continual:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -782,6 +782,7 @@ def _summary(
         "final_checkpoint_path": str(checkpoint_path),
         "final_checkpoint_sha256": sha256_file(checkpoint_path),
         "elapsed_seconds": time.monotonic() - started,
+        "elapsed_seconds_scope": "current_launcher_invocation",
         "per_cycle_probe_auc": probe_rows,
         "final_validation_losses": [
             item["final_validation_ce"] for item in probe_rows

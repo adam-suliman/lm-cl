@@ -422,6 +422,10 @@ class ContinualTrainer:
 
     def _log(self, event: str, **values: Any) -> None:
         assert self.logger is not None
+        if event in {"resume", "probe_resume"}:
+            # Checkpoint counters cover earlier processes; this clock does not.
+            # Keep scientific counters intact and measure only this invocation.
+            self._logging_start_input_tokens = self.state.global_input_tokens
         elapsed = max(time.monotonic() - self.started_at, 1e-12)
         record = {
             "event": event,
@@ -440,10 +444,15 @@ class ContinualTrainer:
             "task_slow_steps": self.state.task_slow_steps,
             "global_slow_steps": self.state.global_slow_steps,
             "global_input_tokens": self.state.global_input_tokens,
+            "process_input_tokens": (
+                self.state.global_input_tokens
+                - getattr(self, "_logging_start_input_tokens", 0)
+            ),
             "global_valid_targets": self.state.global_valid_targets,
             "wall_time_seconds": elapsed,
             "throughput_input_tokens_per_second": (
-                self.state.global_input_tokens / elapsed
+                (self.state.global_input_tokens
+                 - getattr(self, "_logging_start_input_tokens", 0)) / elapsed
             ),
             "learning_rate": (
                 None if self.scheduler is None else self.scheduler.current_lr

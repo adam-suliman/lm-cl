@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -49,28 +50,54 @@ def build_release(output: Path) -> dict[str, object]:
         "run_probe.py",
         "train_continual.py",
         "validate_packed_shards.py",
+        "a100_run.py",
+        "calibrate_continual.py",
+        "local_pipeline_demo.py",
     }
+    # Include advertised operational commands, but keep unrelated unpublished
+    # language diagnostics out of a training release built from a dirty tree.
+    project_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    for module in re.findall(r'= "lm_cl\.cli\.([\w]+):main"', project_text):
+        if "language_fidelity" not in module:
+            public_cli_files.add(module + ".py")
     for path in sorted((ROOT / "src/lm_cl").rglob("*.py")):
         if path.parent == ROOT / "src/lm_cl/cli" and path.name not in public_cli_files:
             continue
+        if "diagnostics" in path.relative_to(ROOT / "src/lm_cl").parts:
+            if path.name != "__init__.py" and not path.name.startswith("local_pipeline_"):
+                continue
         _copy_file(path, output / path.relative_to(ROOT))
     for name in (
         "zyphra_fastmem_a100.yaml",
         "zyphra_controls_a100_40gb_5m_5cycle_1b.yaml",
         "zyphra_controls_a100_80gb_5m_5cycle_1b.yaml",
         "zyphra_fastmem_two_cycle_smoke.yaml",
+        "zyphra_pair_a100_5m_5cycle_1b.yaml",
+        "zyphra_pair_a100_12m_5cycle_1b.yaml",
     ):
         _copy_file(
             ROOT / "configs/experiments" / name,
             output / "configs/experiments" / name,
         )
-    for name in ("zyphra_5m.yaml", "zyphra_12m.yaml", "tiny_test.yaml"):
+    for name in ("zyphra_5m.yaml", "zyphra_12m.yaml", "tiny_test.yaml", "exploratory_1m_nonembedding.yaml"):
         _copy_file(
             ROOT / "configs/models" / name,
             output / "configs/models" / name,
         )
     for name in ("pyproject.toml", ".gitignore"):
         _copy_file(ROOT / name, output / name)
+    # Installed command advertisements must agree with the curated package.
+    # The user's original pyproject and uncommitted diagnostics remain intact.
+    exported_project = output / "pyproject.toml"
+    lines = []
+    for line in exported_project.read_text(encoding="utf-8").splitlines(keepends=True):
+        match = re.search(r'= "lm_cl\.cli\.([\w]+):main"', line)
+        if match and match.group(1) + ".py" not in public_cli_files:
+            continue
+        if match and not (output / "src/lm_cl/cli" / (match.group(1) + ".py")).is_file():
+            raise ValueError(f"Advertised command module is missing: {match.group(1)}")
+        lines.append(line)
+    exported_project.write_text("".join(lines), encoding="utf-8")
     release_readme = (
         ROOT / "release/README.md"
         if (ROOT / "release/README.md").is_file()
@@ -92,9 +119,17 @@ def build_release(output: Path) -> dict[str, object]:
             output / "docs" / name,
         )
     _copy_file(Path(__file__), output / "scripts/build_release.py")
-    focused_test = ROOT / "tests/test_public_release.py"
-    if focused_test.is_file():
-        _copy_file(focused_test, output / "tests/test_public_release.py")
+    for name in ("run_5m.sh", "run_12m.sh"):
+        _copy_file(ROOT / "scripts" / name, output / "scripts" / name)
+    for name in (
+        "test_public_release.py", "test_a100_run.py", "test_calibration.py",
+        "test_incremental_pipeline.py", "test_incremental_remote.py",
+        "test_local_pipeline_estimator.py", "test_local_pipeline_live_plan.py",
+        "test_local_pipeline_resources.py", "test_data_materialization_performance.py",
+    ):
+        focused_test = ROOT / "tests" / name
+        if focused_test.is_file():
+            _copy_file(focused_test, output / "tests" / name)
 
     license_files = [
         path
