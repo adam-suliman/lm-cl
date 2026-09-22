@@ -141,6 +141,12 @@ def build_source(
             source_config.synthetic.ignore_index,
         )
     assert source_config.packed is not None
+    if source_config.kind == "streaming_packed":
+        from lm_cl.data.streaming import source_from_pipeline
+        source = source_from_pipeline(source_config.packed)
+        if source.plan["tokenizer_reference"]["model_embedding_vocab_size"] != model_vocab_size:
+            raise ValueError("Streaming model vocabulary differs")
+        return source, source.identity, -100
     packed = source_config.packed
     source = open_token_batch_source(packed)
     if source.manifest["tokenizer"]["model_embedding_vocab_size"] != (
@@ -361,7 +367,7 @@ class ContinualTrainer:
     def _open_source(
         self, source_config: TrainSourceConfig
     ) -> tuple[Any, dict[str, Any], int]:
-        if source_config.packed is None:
+        if source_config.packed is None or getattr(source_config, "kind", None) == "streaming_packed":
             return build_source(
                 source_config,
                 model_vocab_size=self.config.model.vocab_size,
@@ -612,8 +618,10 @@ class ContinualTrainer:
             self.active_memory = None
 
     def _checkpoint_payload(self) -> dict[str, Any]:
+        from lm_cl.data.streaming import checkpoint_fields
         rng_state = capture_rng_state()
         return {
+            **checkpoint_fields(self.source_identity, self.state.source_position),
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_kind": CHECKPOINT_KIND,
             "model_state": {
@@ -680,6 +688,8 @@ class ContinualTrainer:
         self, checkpoint_path: str | Path
     ) -> dict[str, Any]:
         payload = load_checkpoint(checkpoint_path, map_location="cpu")
+        from lm_cl.data.streaming import validate_checkpoint_prefix
+        validate_checkpoint_prefix(payload)
         if payload["config_sha256"] != self.config_sha256:
             raise ValueError("Resume configuration does not match checkpoint")
         self.model.load_state_dict(payload["model_state"])

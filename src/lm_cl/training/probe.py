@@ -243,6 +243,10 @@ def _validate_source_data_identity(payload: dict[str, Any]) -> None:
         ):
             raise ValueError("Probe synthetic source identity is invalid")
         return
+    if identity.get("kind") == "streaming_packed":
+        from lm_cl.data.streaming import validate_checkpoint_prefix
+        validate_checkpoint_prefix(payload)
+        return
     if identity.get("kind") != "packed_shards":
         raise ValueError("Probe source checkpoint has unknown source identity")
     required = {
@@ -565,8 +569,12 @@ class ProbeTrainer(ContinualTrainer):
         return values
 
     def _checkpoint_payload(self) -> dict[str, Any]:
+        from lm_cl.data.streaming import checkpoint_fields, prefix_proof
         rng = capture_rng_state()
         return {
+            **checkpoint_fields(self.training_source_identity, self.state.source_position),
+            **({"streaming_validation_prefix_proof":prefix_proof(self.validation_source_identity, self.validation_source.token_count)}
+               if self.validation_source_identity.get("kind") == "streaming_packed" else {}),
             "checkpoint_schema_version": PROBE_CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_kind": PROBE_CHECKPOINT_KIND,
             "model_state": {
@@ -633,6 +641,8 @@ class ProbeTrainer(ContinualTrainer):
 
     def _load_resume(self, checkpoint_path: str | Path) -> dict[str, Any]:
         payload = load_probe_checkpoint(checkpoint_path)
+        from lm_cl.data.streaming import validate_checkpoint_prefix
+        validate_checkpoint_prefix(payload, probe=True)
         if payload["config_sha256"] != self.config_sha256:
             raise ValueError("Probe resume configuration differs")
         if payload["source_checkpoint"] != self.source_checkpoint_identity:
@@ -1352,6 +1362,8 @@ class DistributedProbeTrainer(DistributedContinualTrainer, ProbeTrainer):
 
     def _load_resume(self, checkpoint_path: str | Path) -> dict[str, Any]:
         payload = load_probe_checkpoint(checkpoint_path)
+        from lm_cl.data.streaming import validate_checkpoint_prefix
+        validate_checkpoint_prefix(payload, probe=True)
         identities: list[str | None] = [
             None for _ in range(self.distributed.world_size)
         ]

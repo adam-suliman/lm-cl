@@ -72,6 +72,8 @@ def _scientific_identity(
         "tokenizer": data_contract.get("tokenizer"),
         "cycle_manifest_policy": data_contract["cycle_manifest_policy"],
     }
+    if data_contract.get("mode") == "streaming":
+        identity["streaming_recipe_sha256"] = data_contract["streaming_recipe_sha256"]
     if config.forgetting is not None:
         identity["forgetting"] = asdict(config.forgetting)
     return identity
@@ -312,7 +314,7 @@ def build_continual_job_config(
                     ),
                 )
                 source = TrainSourceConfig(
-                    kind="packed_shards", synthetic=None, packed=packed
+                    kind=identity.get("kind", "packed_shards"), synthetic=None, packed=packed
                 )
             validation_source = None
             validation_logical_batches = 0
@@ -321,7 +323,7 @@ def build_continual_job_config(
                     "language_validation_manifests"
                 ][language]
                 validation_source = TrainSourceConfig(
-                    kind="packed_shards",
+                    kind=validation_identity.get("kind", "packed_shards"),
                     synthetic=None,
                     packed=data_pipeline_from_identity(
                         config,
@@ -444,7 +446,7 @@ def build_probe_job_config(
         train_identity = contract["probe_training_manifest"]
         validation_identity = contract["probe_validation_manifest"]
         train_source = TrainSourceConfig(
-            kind="packed_shards",
+            kind=train_identity.get("kind", "packed_shards"),
             synthetic=None,
             packed=data_pipeline_from_identity(
                 config,
@@ -456,7 +458,7 @@ def build_probe_job_config(
             ),
         )
         validation_source = TrainSourceConfig(
-            kind="packed_shards",
+            kind=validation_identity.get("kind", "packed_shards"),
             synthetic=None,
             packed=data_pipeline_from_identity(
                 config,

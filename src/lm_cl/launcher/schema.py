@@ -179,16 +179,24 @@ class DataSettings:
     validation_permyriad: int = 100
     max_shard_tokens: int = 250_000_000
     window_source_tokens_per_task: int | None = None
+    streaming: dict[str, Any] | None = None
 
     def validate(self, experiment: ExperimentSettings) -> None:
-        if self.mode not in {"packed", "synthetic"}:
+        if self.mode not in {"packed", "synthetic", "streaming"}:
             raise ValueError("data.mode must be packed or synthetic")
         if self.cycle_manifest_policy not in CYCLE_MANIFEST_POLICIES:
             raise ValueError(
                 "data.cycle_manifest_policy must be one of "
                 f"{sorted(CYCLE_MANIFEST_POLICIES)}"
             )
-        if self.mode == "packed":
+        if self.mode == "streaming":
+            from lm_cl.launcher.streaming import StreamingSettings
+            StreamingSettings(**(self.streaming or {})).validate(experiment.sequence_length)
+            if self.cycle_manifest_policy != "disjoint_sequence_windows_v1":
+                raise ValueError("Streaming requires disjoint sequence windows")
+        elif self.streaming is not None:
+            raise ValueError("Streaming settings require streaming mode")
+        if self.mode in {"packed", "streaming"}:
             required = {
                 "manifest_root": self.manifest_root,
                 "manifest_template": self.manifest_template,
@@ -528,7 +536,7 @@ class ForgettingSettings:
                     "Disabled forgetting requires zero validation sequences"
                 )
             return
-        if data.mode != "packed":
+        if data.mode not in {"packed", "streaming"}:
             raise ValueError(
                 "Forgetting evaluation currently requires packed held-out data"
             )
@@ -597,6 +605,8 @@ class LauncherConfig:
         # defaults keeps existing launcher/checkpoint identities resumable.
         if values["data"].get("language_validation_manifest_template") is None:
             values["data"].pop("language_validation_manifest_template", None)
+        if values["data"].get("streaming") is None:
+            values["data"].pop("streaming", None)
         if values["data"].get("window_source_tokens_per_task") is None:
             values["data"].pop("window_source_tokens_per_task", None)
         if values.get("forgetting") is None:

@@ -409,7 +409,7 @@ class Producer:
                 self._reject("duplicate_content_or_tokens")
                 continue
             remaining = self.recipe.output_tokens - self.state["assigned_tokens"]
-            if remaining < 2:
+            if remaining < (1 if getattr(self, "allow_empty_final_document", False) else 2):
                 raise RuntimeError("Exact budget cannot fit final document plus EOS")
             truncated = len(ids) + 1 > remaining
             kept = ids[:remaining-1]

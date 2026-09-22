@@ -782,6 +782,8 @@ class DistributedContinualTrainer(ContinualTrainer):
         checkpoint_path: str | Path,
     ) -> dict[str, Any]:
         payload = load_checkpoint(checkpoint_path, map_location="cpu")
+        from lm_cl.data.streaming import validate_checkpoint_prefix
+        validate_checkpoint_prefix(payload)
         identity = sha256_file(checkpoint_path)
         identities: list[str | None] = [
             None for _ in range(self.distributed.world_size)

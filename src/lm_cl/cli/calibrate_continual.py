@@ -82,7 +82,7 @@ def calibrate(config_path, output_dir, *, gpus, warmup=2, batches=8,
         raise ValueError("Calibration output must differ from the scientific run output")
     if config.runtime.device != "cuda":
         raise ValueError("This calibration entry point requires an explicit CUDA config")
-    if any(task.train_source.kind != "packed_shards" for task in config.tasks):
+    if any(task.train_source.kind not in {"packed_shards", "streaming_packed"} for task in config.tasks):
         raise ValueError("Performance calibration requires recorded packed data")
     if os.environ.get("CUDA_VISIBLE_DEVICES"):
         raise ValueError("Unset CUDA_VISIBLE_DEVICES; --gpus selects physical device IDs")

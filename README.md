@@ -21,8 +21,15 @@ primary cycle-end Vietnamese probe is `system`: no-memory variants report an
 ordinary curve; memory variants report carried-memory full-system plasticity
 while retaining the reset curve as a diagnostic.
 
-For the two immediate 5M A100 causal controls and exact one-GPU/multi-GPU
-commands, follow [A100_CONTROLS.md](docs/A100_CONTROLS.md).
+For fresh **5M/12M streaming runs on one or two A100s**, follow the short
+[runbook](docs/A100_CONTROLS.md). `scripts/run_5m.sh` and `scripts/run_12m.sh`
+default to a read-only plan; `--action run` inspects the pinned tokenizer and
+starts a supervised streaming producer alongside training. Only verified
+completed blocks reach the trainer. The disposable token cache defaults to
+4 GiB; receipts, provenance and checkpoints are retained separately.
+
+This is a new paired data identity, not a reconstruction of historical H100
+packed pools. See [streaming semantics and recovery](docs/STREAMING_DATA.md).
 
 ## Install
 
@@ -33,7 +40,7 @@ package and its data, tracking, and test extras:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[data,tracking,test]'
+python -m pip install -e '.[data,pipeline,tracking,test]'
 python -m lm_cl.cli.inspect_environment
 ```
 
@@ -45,7 +52,7 @@ This export therefore does not invent or imply a license; obtain the necessary
 permission before redistributing or using it beyond the rights you already
 hold.
 
-## Prepare packed data
+## Legacy full packed preparation (opt-in)
 
 Choose machine-owned roots with ample storage:
 

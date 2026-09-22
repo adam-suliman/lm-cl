@@ -68,6 +68,7 @@ class RemoteAccess:
                         a,b = byte_range
                         if len(data) != b-a or not response.headers.get("Content-Range", "").startswith(f"bytes {a}-{b-1}/"):
                             raise ValueError("Invalid HTTP range response")
+                self.last_links = dict(response.links)
                 self.requests += 1
                 with self.log.open("a") as f:
                     f.write(json.dumps({"request": request_number, "attempt": attempt+1, "status": status,

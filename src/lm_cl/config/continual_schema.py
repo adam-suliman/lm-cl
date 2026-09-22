@@ -28,7 +28,7 @@ class TrainSourceConfig:
     packed: DataPipelineConfig | None
 
     def validate(self, *, allow_pending_packed: bool = False) -> None:
-        if self.kind not in {"synthetic", "packed_shards"}:
+        if self.kind not in {"synthetic", "packed_shards", "streaming_packed"}:
             raise ValueError(
                 "Continual training supports only synthetic and packed_shards"
             )
@@ -56,7 +56,10 @@ class TrainSourceConfig:
                 raise ValueError(
                     "Packed training/evaluation source has an invalid purpose"
                 )
-            if not allow_pending_packed:
+            if self.kind == "streaming_packed":
+                from lm_cl.data.streaming import source_from_pipeline
+                source_from_pipeline(self.packed)
+            elif not allow_pending_packed:
                 self.packed.require_packed_launch_ready()
 
     @property

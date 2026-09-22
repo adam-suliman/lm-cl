@@ -18,7 +18,8 @@ experiment:
   run_kind: scaled_budget
 
 data:
-  mode: packed
+  # Fresh recipe-bound streaming study; legacy manifests are opt-in.
+  mode: streaming
   manifest_root: ${LM_CL_DATA_ROOT}/generated/stages
   manifest_template: zyphra-cycle-0000-{language}-task-{source_task_index:04d}-{effective_tokens}/manifest.json
   cycle_manifest_policy: disjoint_sequence_windows_v1

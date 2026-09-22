@@ -403,6 +403,10 @@ def iter_partitioned_batches(
                 global_offset + global_count * sequence_length
             )
             global_end = global_start + global_count
+            prefetch = getattr(source, "prefetch_window", None)
+            if prefetch is not None:
+                prefetch(global_end * sequence_length,
+                         source.token_count if sequence_prefix_count is None else sequence_prefix_count * sequence_length)
             valid_targets = partition.size * (sequence_length - 1)
         elif isinstance(source, ArrayTokenSource):
             global_offset = source._offset(position)

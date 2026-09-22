@@ -33,6 +33,8 @@ def test_size_script_defaults_to_a_read_only_plan(tmp_path, size, gpus, per_job)
     assert cfg["experiment"]["resume"] == "never"
     assert cfg["training"]["global_batch_sequences"] == 256
     assert cfg["data"]["prepare_if_missing"] is False
+    assert cfg["data"]["mode"] == "streaming"
+    assert value["incremental_block_production_launch_supported"] is True
     assert cfg["launcher"]["gpus_per_job"] == per_job
     assert cfg["launcher"]["max_parallel_jobs"] == len(gpus.split(",")) // per_job
     assert not data.exists() and not output.exists()
@@ -75,6 +77,6 @@ def test_fresh_probe_pool_name_matches_prepared_budget_and_allows_explicit_reuse
     config = build_config(parser().parse_args(base))
     assert "499998720" in config.data.probe_training_manifest
     existing = tmp_path / "existing-5b-pool/manifest.json"
-    config = build_config(parser().parse_args([*base, "--probe-training-manifest", str(existing)]))
+    config = build_config(parser().parse_args([*base, "--data-mode", "packed", "--probe-training-manifest", str(existing)]))
     assert config.data.probe_training_manifest == str(existing)
     assert config.probe.training_tokens == 500000000

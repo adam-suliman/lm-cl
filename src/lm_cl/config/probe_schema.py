@@ -112,7 +112,7 @@ class ProbeExperimentConfig:
         role: str,
         allow_pending_packed: bool,
     ) -> None:
-        if source.kind not in {"synthetic", "packed_shards"}:
+        if source.kind not in {"synthetic", "packed_shards", "streaming_packed"}:
             raise ValueError(f"Probe {role} source kind is invalid")
         if source.kind == "synthetic":
             if source.synthetic is None or source.packed is not None:
@@ -129,7 +129,10 @@ class ProbeExperimentConfig:
             raise ValueError(f"Packed probe {role} requires only packed data")
         source.packed.validate()
         source.packed.require_access_ready()
-        if not allow_pending_packed:
+        if source.kind == "streaming_packed":
+            from lm_cl.data.streaming import source_from_pipeline
+            source_from_pipeline(source.packed)
+        elif not allow_pending_packed:
             source.packed.require_packed_launch_ready()
         if source.packed.mode != "packed_shards":
             raise ValueError("Probe execution requires completed packed shards")
@@ -293,7 +296,7 @@ class ProbeExperimentConfig:
                 raise ValueError(
                     "train_sequence_prefix_count must be a positive integer"
                 )
-            if self.train_source.kind != "packed_shards":
+            if self.train_source.kind not in {"packed_shards", "streaming_packed"}:
                 raise ValueError(
                     "train_sequence_prefix_count requires packed training data"
                 )

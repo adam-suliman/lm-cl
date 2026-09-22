@@ -92,6 +92,9 @@ def command() -> None:
         raise ImportError(
             "tracking.tensorboard=true requires: python -m pip install 'lm-cl[tracking]'"
         )
+    from lm_cl.launcher.streaming import prepare_streaming, producer_service
+    if config.data.mode == "streaming" and not args.dry_run:
+        prepare_streaming(config)
     data_contract = resolve_data_contract(
         config,
         full_checksum_validation=not args.manifest_only_preflight,
@@ -113,7 +116,8 @@ def command() -> None:
         return
     write_job_configurations(jobs, preflight)
     scheduler = LocalJobScheduler(config, jobs, assignments)
-    results = scheduler.run()
+    with producer_service(data_contract):
+        results = scheduler.run()
     summary_path, csv_path = write_launcher_summaries(config, results)
     failed = [item for item in results if item.get("status") != "complete"]
     if failed:

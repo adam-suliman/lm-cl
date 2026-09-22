@@ -111,9 +111,21 @@ def _checkpoint_estimate(config: LauncherConfig, job_count: int) -> dict[str, in
     probe_checkpoints = (
         config.experiment.cycles if config.probe.enabled else 0
     )
-    per_job_count = continual_checkpoints + probe_checkpoints
+    periodic = 0
+    every = config.training.checkpoint_frequency
+    if every:
+        from math import ceil
+        from lm_cl.launcher.schema import resolve_token_budget
+        def batches(tokens):
+            budget = resolve_token_budget(tokens, config.experiment.sequence_length, policy=config.experiment.token_budget_policy)
+            return ceil(budget.effective_complete_sequences / config.training.global_batch_sequences)
+        periodic = (batches(config.experiment.tokens_per_task) * len(PUBLIC_LANGUAGE_ORDER) * config.experiment.cycles) // every
+        if config.probe.enabled:
+            periodic += config.experiment.cycles * ((batches(config.probe.training_tokens)-1)//every)
+    per_job_count = continual_checkpoints + probe_checkpoints + periodic
     return {
         "estimated_bytes_per_checkpoint": per_checkpoint,
+        "estimated_periodic_checkpoints_per_job": periodic,
         "estimated_checkpoints_per_job": per_job_count,
         "estimated_bytes_per_job": per_checkpoint * per_job_count,
         "estimated_total_checkpoint_bytes": (
@@ -195,6 +207,21 @@ def preflight_launch(
         estimates["estimated_total_checkpoint_bytes"]
         + config.launcher.disk_free_floor_bytes
     )
+    streaming_disk = None
+    if config.data.mode == "streaming":
+        from lm_cl.launcher.streaming import settings
+        limits = settings(config)
+        root = Path(jobs[0].resolved_experiment["data_contract"]["streaming_root"])
+        data_disk = shutil.disk_usage(root)
+        reserve = limits.token_cache_bytes + limits.metadata_bytes
+        same_mount = root.stat().st_dev == probe_path.stat().st_dev
+        streaming_disk = {"path":str(root), "cache_and_metadata_reserve_bytes":reserve,
+                          "free_bytes":data_disk.free, "same_mount_as_output":same_mount}
+        if same_mount:
+            required += reserve
+            required = max(required, estimates["estimated_total_checkpoint_bytes"] + reserve + limits.minimum_free_bytes)
+        elif data_disk.free < reserve + limits.minimum_free_bytes:
+            raise ValueError("Streaming data-cache/metadata disk admission failed")
     if disk.free < required:
         raise ValueError(
             "Disk admission failed: "
@@ -213,6 +240,7 @@ def preflight_launch(
             "free_bytes": disk.free,
             "required_bytes": required,
             "free_floor_bytes": config.launcher.disk_free_floor_bytes,
+            "streaming": streaming_disk,
             **estimates,
         },
         "old_resolved": old_resolved,

@@ -677,6 +677,9 @@ def resolve_data_contract(
     *,
     full_checksum_validation: bool = True,
 ) -> dict[str, Any]:
+    if config.data.mode == "streaming":
+        from lm_cl.launcher.streaming import resolve_streaming_contract
+        return resolve_streaming_contract(config)
     task_budget = resolve_token_budget(
         config.experiment.tokens_per_task,
         config.experiment.sequence_length,
@@ -947,6 +950,15 @@ def data_pipeline_from_identity(
     purpose: str,
     global_sequences_per_batch: int,
 ) -> DataPipelineConfig:
+    if identity.get("kind") == "streaming_packed":
+        from dataclasses import replace
+        from lm_cl.config.continual_yaml import _data_pipeline_from_mapping
+        from lm_cl.data.streaming import source_from_pipeline
+        pipeline = _data_pipeline_from_mapping(identity["pipeline"])
+        if pipeline.stage.purpose != purpose:
+            raise ValueError("Streaming source purpose differs")
+        source_from_pipeline(pipeline)
+        return replace(pipeline, reader=replace(pipeline.reader, global_sequences_per_batch=global_sequences_per_batch))
     if config.data.mode != "packed":
         raise ValueError("Packed data pipeline requested for synthetic mode")
     manifest_path = Path(identity["manifest_path"]).resolve()
@@ -1165,6 +1177,12 @@ def prepare_or_validate_data(
     full_checksum_validation: bool = True,
     parallel_languages: int = 1,
 ) -> dict[str, Any]:
+    if config.data.mode == "streaming":
+        if parallel_languages != 1:
+            raise ValueError("Streaming preparation uses one ordered producer")
+        from lm_cl.launcher.streaming import prepare_streaming, resolve_streaming_contract
+        execute = config.data.prepare_if_missing if execute_missing is None else execute_missing
+        return prepare_streaming(config) if execute else resolve_streaming_contract(config)
     if parallel_languages <= 0 or parallel_languages > len(LANGUAGE_CONFIGS):
         raise ValueError("parallel_languages must be in [1, 9]")
     if config.data.mode == "synthetic":
