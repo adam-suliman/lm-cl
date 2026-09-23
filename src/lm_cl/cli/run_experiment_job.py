@@ -14,6 +14,8 @@ def command() -> None:
     )
     parser.add_argument("--resolved-config", required=True)
     parser.add_argument("--rendezvous-port", type=int, required=True)
+    parser.add_argument("--alternating-turn", type=int, default=None,
+                        help="execute only this open, recipe-bound streaming turn")
     parser.add_argument(
         "--retry-resume",
         action="store_true",
@@ -25,6 +27,7 @@ def command() -> None:
             args.resolved_config,
             rendezvous_port=args.rendezvous_port,
             retry_resume=args.retry_resume,
+            alternating_turn=args.alternating_turn,
         )
     )
 

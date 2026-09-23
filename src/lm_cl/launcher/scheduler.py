@@ -122,10 +122,22 @@ def _checkpoint_estimate(config: LauncherConfig, job_count: int) -> dict[str, in
         periodic = (batches(config.experiment.tokens_per_task) * len(PUBLIC_LANGUAGE_ORDER) * config.experiment.cycles) // every
         if config.probe.enabled:
             periodic += config.experiment.cycles * ((batches(config.probe.training_tokens)-1)//every)
-    per_job_count = continual_checkpoints + probe_checkpoints + periodic
+    turn_checkpoints = 0
+    if config.data.mode == "streaming":
+        from lm_cl.launcher.streaming import settings, AlternatingSettings
+        limits = settings(config)
+        if isinstance(limits, AlternatingSettings):
+            from math import ceil
+            from lm_cl.launcher.schema import resolve_token_budget
+            count = resolve_token_budget(config.experiment.tokens_per_task, config.experiment.sequence_length,
+                                         policy=config.experiment.token_budget_policy).effective_complete_sequences
+            task_batches = ceil(count / config.training.global_batch_sequences)
+            turn_checkpoints = config.experiment.cycles * len(PUBLIC_LANGUAGE_ORDER) * ((task_batches - 1) // limits.chunk_batches)
+    per_job_count = continual_checkpoints + probe_checkpoints + periodic + turn_checkpoints
     return {
         "estimated_bytes_per_checkpoint": per_checkpoint,
         "estimated_periodic_checkpoints_per_job": periodic,
+        "estimated_alternating_turn_checkpoints_per_job": turn_checkpoints,
         "estimated_checkpoints_per_job": per_job_count,
         "estimated_bytes_per_job": per_checkpoint * per_job_count,
         "estimated_total_checkpoint_bytes": (
@@ -214,8 +226,19 @@ def preflight_launch(
         root = Path(jobs[0].resolved_experiment["data_contract"]["streaming_root"])
         data_disk = shutil.disk_usage(root)
         reserve = limits.token_cache_bytes + limits.metadata_bytes
+        from lm_cl.launcher.streaming import AlternatingSettings
+        pinned_bytes = 0
+        if isinstance(limits, AlternatingSettings):
+            from lm_cl.data.streaming import load_plan
+            plan = load_plan(root)
+            pinned_bytes = sum(spec["output_tokens"] * 4 for name, spec in plan["streams"].items()
+                               if plan["purposes"][name] != "continual_train")
+            reserve += pinned_bytes
         same_mount = root.stat().st_dev == probe_path.stat().st_dev
-        streaming_disk = {"path":str(root), "cache_and_metadata_reserve_bytes":reserve,
+        streaming_disk = {"path":str(root),
+                          "cache_and_metadata_reserve_bytes":limits.token_cache_bytes + limits.metadata_bytes,
+                          "total_streaming_reserve_bytes":reserve,
+                          "pinned_token_bytes": pinned_bytes,
                           "free_bytes":data_disk.free, "same_mount_as_output":same_mount}
         if same_mount:
             required += reserve
@@ -341,6 +364,11 @@ class LocalJobScheduler:
         )
 
     def run(self) -> list[dict[str, Any]]:
+        if type(self) is LocalJobScheduler and self.config.data.mode == "streaming":
+            from lm_cl.launcher.streaming import settings, AlternatingSettings
+            if isinstance(settings(self.config), AlternatingSettings):
+                from lm_cl.launcher.alternating import run_alternating
+                return run_alternating(self.config, self.jobs, self.assignments)
         experiment_dir = (
             Path(self.config.experiment.output_root)
             / self.config.experiment.name
@@ -404,7 +432,7 @@ class LocalJobScheduler:
                     results.append(summary)
                     index_logger.log(
                         {
-                            "event": "job_completed",
+                            "event": "job_yielded" if summary.get("status") == "yielded" else "job_completed",
                             "job_id": item.assignment.job_id,
                             "attempt": item.attempt,
                             "status": status,

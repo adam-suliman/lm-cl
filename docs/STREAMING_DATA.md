@@ -1,5 +1,11 @@
 # Production streaming data contract (v1)
 
+This document describes the default independent schedule. The optional
+`--streaming-schedule alternating` uses a separate versioned storage contract,
+compact receipts, pinned reusable data, and checkpoint-acknowledged release;
+see [ALTERNATING_STREAMING.md](ALTERNATING_STREAMING.md). Existing v1 recipes and
+their reconstruction behavior remain supported without migration.
+
 The `streaming` launcher mode is a new production route. The network-facing CPU
 producer emits completed, checksum-verified uint32 blocks; continual/probe
 trainers consume only those blocks through `streaming_packed` sources. Neither

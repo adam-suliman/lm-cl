@@ -190,8 +190,8 @@ class DataSettings:
                 f"{sorted(CYCLE_MANIFEST_POLICIES)}"
             )
         if self.mode == "streaming":
-            from lm_cl.launcher.streaming import StreamingSettings
-            StreamingSettings(**(self.streaming or {})).validate(experiment.sequence_length)
+            from lm_cl.launcher.streaming import settings_from_mapping
+            settings_from_mapping(self.streaming).validate(experiment.sequence_length)
             if self.cycle_manifest_policy != "disjoint_sequence_windows_v1":
                 raise ValueError("Streaming requires disjoint sequence windows")
         elif self.streaming is not None:
@@ -585,6 +585,17 @@ class LauncherConfig:
         self.experiment.validate()
         self.data.validate(self.experiment)
         self.training.validate()
+        if self.data.mode == "streaming":
+            from lm_cl.launcher.streaming import settings, AlternatingSettings
+            limits = settings(self)
+            if isinstance(limits, AlternatingSettings):
+                from math import ceil
+                task = resolve_token_budget(self.experiment.tokens_per_task, self.experiment.sequence_length,
+                                            policy=self.experiment.token_budget_policy).effective_input_tokens
+                turn = min(task, limits.chunk_batches * self.training.global_batch_sequences * self.experiment.sequence_length)
+                # One extra block covers a turn beginning inside a prior block.
+                if (ceil(turn / limits.block_tokens) + 1) * limits.block_tokens * 4 > limits.token_cache_bytes:
+                    raise ValueError("Alternating queue must fit one complete chunk plus a boundary block")
         self.fastmem.validate(self.experiment)
         self.launcher.validate(self.training)
         self.tracking.validate()

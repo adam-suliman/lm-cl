@@ -24,6 +24,7 @@ from lm_cl.data.storage import atomic_write_json
 from lm_cl.data.types import TokenBatch, TokenPosition
 
 FORMAT = "lm-cl-production-streaming-v1"
+ALTERNATING_FORMAT = "lm-cl-alternating-streaming-v1"
 
 
 @contextmanager
@@ -52,15 +53,15 @@ def connect(root, *, create=False):
 def validate_plan(plan):
     from lm_cl.data.incremental import Recipe
     from lm_cl.data.incremental_remote import REVISION, MAPPINGS
-    from lm_cl.launcher.streaming import StreamingSettings
-    if (plan["format"] != FORMAT or plan["policy"] != "serial_interleaved_global_dedup_v1"
+    from lm_cl.launcher.streaming import StreamingSettings, AlternatingSettings
+    if (plan["format"] not in {FORMAT, ALTERNATING_FORMAT} or plan["policy"] != "serial_interleaved_global_dedup_v1"
             or plan["final_document_remainder"] != "eos_only_if_one_token_v1"):
         raise ValueError("Unknown streaming preparation policy/version")
     offsets = {}
     for name, spec in plan["streams"].items():
         recipe = Recipe(**spec)
         recipe.validate()
-        StreamingSettings(**plan["limits"]).validate(recipe.sequence_length)
+        (AlternatingSettings if plan["format"] == ALTERNATING_FORMAT else StreamingSettings)(**plan["limits"]).validate(recipe.sequence_length)
         if (recipe.purpose not in {"train", "validation"} or name != f"{recipe.purpose}-{recipe.language}"
                 or recipe.block_tokens != plan["limits"]["block_tokens"]
                 or recipe.source_identity.get("revision") != REVISION
@@ -77,17 +78,20 @@ def validate_plan(plan):
         offsets[name] += count
     if any(offsets[name] != spec["output_tokens"] for name,spec in plan["streams"].items()):
         raise ValueError("Streaming plan does not cover the exact frozen budgets")
+    if plan["format"] == ALTERNATING_FORMAT:
+        from lm_cl.data.alternating import validate_alternation
+        validate_alternation(plan)
 
 
 def load_plan(root):
     root = Path(root).resolve()
     plan = json.loads((root / "study.json").read_text())
     claimed = plan.pop("sha256")
-    if plan["format"] != FORMAT or digest(plan) != claimed:
+    if plan["format"] not in {FORMAT, ALTERNATING_FORMAT} or digest(plan) != claimed:
         raise ValueError("Unknown/corrupt streaming study recipe")
     validate_plan(plan)
     owner = json.loads((root / ".streaming-owner.json").read_text())
-    if owner != {"format": FORMAT, "recipe_sha256": claimed}:
+    if owner != {"format": plan["format"], "recipe_sha256": claimed}:
         raise ValueError("Streaming cache ownership mismatch")
     plan["sha256"] = claimed
     return plan
@@ -109,7 +113,7 @@ def initialize(root, plan):
     for name in ("cache", "requests", "raw"):
         (root / name).mkdir()
     atomic_write_json(root / "study.json", plan)
-    atomic_write_json(root / ".streaming-owner.json", {"format": FORMAT, "recipe_sha256": plan["sha256"]})
+    atomic_write_json(root / ".streaming-owner.json", {"format": plan["format"], "recipe_sha256": plan["sha256"]})
     with connect(root, create=True) as db:
         db.executescript("""
         CREATE TABLE receipts (ordinal INTEGER PRIMARY KEY, stream TEXT NOT NULL,
@@ -118,6 +122,9 @@ def initialize(root, plan):
         CREATE TABLE content_hashes (hash TEXT PRIMARY KEY, ordinal INTEGER NOT NULL);
         CREATE TABLE token_hashes (hash TEXT PRIMARY KEY, ordinal INTEGER NOT NULL);
         """)
+        if plan["format"] == ALTERNATING_FORMAT:
+            from lm_cl.data.alternating import initialize_tables
+            initialize_tables(root, plan, db)
     os.rename(root, destination)
     fd = os.open(destination.parent, os.O_RDONLY)
     try:
@@ -201,6 +208,12 @@ def validate_prefix(identity, proof):
 
 def cache_path(root, ordinal):
     return Path(root) / "cache" / f"{ordinal:08d}.bin"
+
+
+def block_path(root, plan, ordinal):
+    if plan["format"] == ALTERNATING_FORMAT and plan["purposes"][plan["blocks"][ordinal]["stream"]] != "continual_train":
+        return Path(root) / "pinned" / f"{ordinal:08d}.bin"
+    return cache_path(root, ordinal)
 
 
 def publish_cache(root, plan, ordinal, content):
@@ -292,6 +305,10 @@ class StreamingPackedSource(PackedShardSource):
         return TokenPosition(0, sequence_index*sequence_length)
 
     def _request(self, block):
+        if self.plan["format"] == ALTERNATING_FORMAT:
+            from lm_cl.data.alternating import request_allowed
+            if not request_allowed(self.root, self.plan, block["ordinal"]):
+                return
         path = self.root / "requests" / f"{block['ordinal']:08d}.json"
         with lock(self.root / "requests.lock"):
             if not path.exists():
@@ -306,7 +323,9 @@ class StreamingPackedSource(PackedShardSource):
                 raise ValueError("Symlinked disposable cache is forbidden")
             with lock(self.root / "cache.lock"):
                 item = receipt(self.root, block["ordinal"])
-                path = cache_path(self.root, block["ordinal"])
+                path = block_path(self.root, self.plan, block["ordinal"])
+                if path.parent.is_symlink():
+                    raise ValueError("Symlinked block directory is forbidden")
                 if path.is_symlink():
                     raise ValueError("Symlinked block is forbidden")
                 if item is not None and path.is_file():

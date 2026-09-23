@@ -30,6 +30,12 @@ completed blocks reach the trainer. The disposable token cache defaults to
 
 This is a new paired data identity, not a reconstruction of historical H100
 packed pools. See [streaming semantics and recovery](docs/STREAMING_DATA.md).
+For a smaller preparation-history footprint, select
+`--streaming-schedule alternating`: models/seeds take bounded turns, reusable
+Vietnamese/validation data stays pinned, and acknowledged continual blocks are
+released. The default independent schedule remains available. See
+[alternating streaming](docs/ALTERNATING_STREAMING.md) for its checkpoint and
+storage tradeoffs.
 
 ## Install
 

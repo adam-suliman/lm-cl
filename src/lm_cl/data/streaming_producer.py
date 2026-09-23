@@ -33,7 +33,7 @@ class Budget:
             raise RuntimeError("Streaming free-space floor reached")
         metadata = 0
         for path in self.root.rglob("*"):
-            if "cache" in path.relative_to(self.root).parts:
+            if any(name in path.relative_to(self.root).parts for name in ("cache", "pinned")):
                 continue
             try:
                 if path.is_file() and not path.is_symlink():
@@ -311,7 +311,12 @@ class ProductionProducer:
 def main():
     import argparse
     p=argparse.ArgumentParser(description=__doc__);p.add_argument("root");args=p.parse_args()
-    ProductionProducer(args.root).serve()
+    from lm_cl.data.streaming import ALTERNATING_FORMAT
+    if load_plan(args.root)["format"] == ALTERNATING_FORMAT:
+        from lm_cl.data.alternating import AlternatingProducer
+        AlternatingProducer(args.root).serve()
+    else:
+        ProductionProducer(args.root).serve()
 
 
 if __name__ == "__main__": main()

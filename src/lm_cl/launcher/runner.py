@@ -199,6 +199,7 @@ def _run_continual_stage(
     world_size: int,
     rendezvous_port: int,
     environment: dict[str, str],
+    stop_after_global_logical_batches: int | None = None,
 ) -> dict[str, Any]:
     if checkpoint is None:
         module = "lm_cl.cli.train_continual"
@@ -214,6 +215,8 @@ def _run_continual_stage(
             str(result_path),
         ]
     )
+    if stop_after_global_logical_batches is not None:
+        args.extend(["--stop-after-global-logical-batches", str(stop_after_global_logical_batches)])
     controller.run(
         _stage_command(
             module=module,
@@ -807,6 +810,7 @@ def run_resolved_job(
     *,
     rendezvous_port: int,
     retry_resume: bool = False,
+    alternating_turn: int | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     resolved_file = Path(resolved_path).resolve()
@@ -843,6 +847,15 @@ def run_resolved_job(
     checkpoint_payload: dict[str, Any] | None = None
     resume_mode = "auto" if retry_resume else config.experiment.resume
     try:
+        turn = None
+        if alternating_turn is not None:
+            from lm_cl.data.streaming import load_plan, ALTERNATING_FORMAT
+            from lm_cl.data.alternating import control
+            root = Path(resolved["data_contract"]["streaming_root"])
+            plan = load_plan(root)
+            if plan["format"] != ALTERNATING_FORMAT or control(root, plan)["turn"] != alternating_turn:
+                raise ValueError("Requested alternating turn is not open")
+            turn = plan["alternation"]["turns"][alternating_turn]
         if resume_mode == "never":
             if pointer_path.exists() or (job_dir / "resolved_config.yaml").exists():
                 raise FileExistsError("resume=never refuses existing job state")
@@ -1115,7 +1128,12 @@ def run_resolved_job(
                 boundary_tasks = (cycle_index + 1) * len(
                     PUBLIC_LANGUAGE_ORDER
                 )
-                if current_completed_tasks == boundary_tasks:
+                # An active task immediately after Russian has the same
+                # completed-task count as that cycle boundary. Its newer
+                # optimizer/memory/data position must not be rewound while
+                # recovering the preceding cycle's probe summaries.
+                if (current_completed_tasks == boundary_tasks
+                        and current_payload["trainer_state"]["phase"] == "task_boundary"):
                     current_checkpoint = augmented_path
                     current_payload = augmented_payload
                     pointer = pointer_for_checkpoint(
@@ -1150,6 +1168,23 @@ def run_resolved_job(
             return current_checkpoint, current_payload
 
         total_tasks = len(continual.tasks)
+        def finish_turn(path, payload):
+            state = payload["trainer_state"]
+            if state["global_input_tokens"] != turn["end_tokens"] or state["global_logical_batches"] != turn["end_batches"]:
+                raise ValueError("Alternating turn stopped at a different position")
+            pointer = pointer_for_checkpoint(path, job_dir=job_dir,
+                scientific_sha256=spec.scientific_sha256, resolved_experiment_sha256=spec.resolved_sha256,
+                requested_horizon_cycles=config.experiment.cycles)
+            write_latest_pointer(job_dir, pointer)
+            result = {"summary_schema_version": 1, "status": "yielded", "model": spec.public_model,
+                      "seed": spec.seed, "alternating_turn": alternating_turn,
+                      "final_checkpoint_path": str(path), "final_checkpoint_sha256": pointer["checkpoint_sha256"],
+                      "total_input_tokens": state["global_input_tokens"], "completed_language_tasks": completed_tasks}
+            atomic_write_json(job_dir / "summary.json", result)
+            metadata["status"] = "yielded"
+            atomic_write_json(metadata_path, metadata)
+            return result
+
         if checkpoint is not None and checkpoint_payload is not None:
             checkpoint, checkpoint_payload = ensure_completed_cycles(
                 checkpoint,
@@ -1158,13 +1193,21 @@ def run_resolved_job(
                 recovery=True,
                 stage_attempt=None,
             )
+            if turn is not None:
+                progress = checkpoint_payload["trainer_state"]["global_logical_batches"]
+                if progress > turn["end_batches"]:
+                    raise ValueError("Checkpoint is beyond the open alternating turn")
+                if progress == turn["end_batches"] and completed_tasks < total_tasks:
+                    return finish_turn(checkpoint, checkpoint_payload)
         while completed_tasks < total_tasks:
             target_boundary = min(
                 ((completed_tasks // len(PUBLIC_LANGUAGE_ORDER)) + 1)
                 * len(PUBLIC_LANGUAGE_ORDER),
                 total_tasks,
             )
-            cycle_index = target_boundary // len(PUBLIC_LANGUAGE_ORDER) - 1
+            if turn is not None:
+                target_boundary = turn["task_index"] + 1
+            cycle_index = (target_boundary - 1) // len(PUBLIC_LANGUAGE_ORDER)
             result_root = job_dir / "internal" / "results"
             result_path, stage_attempt = _next_attempt_path(
                 result_root, f"continual-cycle-{cycle_index + 1:04d}"
@@ -1178,10 +1221,14 @@ def run_resolved_job(
                 world_size=world_size,
                 rendezvous_port=rendezvous_port + cycle_index * 4,
                 environment=environment,
+                **({"stop_after_global_logical_batches": turn["end_batches"]}
+                   if turn is not None and not turn["task_boundary"] else {}),
             )
             checkpoint = Path(result["checkpoint_path"]).resolve()
             checkpoint_payload = load_checkpoint(checkpoint)
             state = checkpoint_payload["trainer_state"]
+            if turn is not None and not turn["task_boundary"]:
+                return finish_turn(checkpoint, checkpoint_payload)
             if (
                 state["phase"] != "task_boundary"
                 or state["next_task_index"] != target_boundary
@@ -1195,6 +1242,8 @@ def run_resolved_job(
                 recovery=False,
                 stage_attempt=stage_attempt,
             )
+            if turn is not None and completed_tasks < total_tasks:
+                return finish_turn(checkpoint, checkpoint_payload)
 
         assert checkpoint is not None and checkpoint_payload is not None
         summary = _summary(

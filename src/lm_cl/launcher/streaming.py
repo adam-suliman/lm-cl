@@ -46,8 +46,22 @@ class StreamingSettings:
             raise ValueError("Consumer wait must exceed one block preparation deadline")
 
 
+@dataclass(frozen=True)
+class AlternatingSettings(StreamingSettings):
+    metadata_bytes: int = 8 * 1024**3
+    chunk_batches: int = 2048
+
+
+def settings_from_mapping(mapping):
+    values = dict(mapping or {})
+    schedule = values.pop("schedule", "independent")
+    if schedule not in {"independent", "alternating"}:
+        raise ValueError("Unknown streaming schedule")
+    return (AlternatingSettings if schedule == "alternating" else StreamingSettings)(**values)
+
+
 def settings(config):
-    value = StreamingSettings(**(config.data.streaming or {}))
+    value = settings_from_mapping(config.data.streaming)
     value.validate(config.experiment.sequence_length)
     return value
 
@@ -94,6 +108,9 @@ def _plan(config):
     plan = {"format":FORMAT, "final_document_remainder":"eos_only_if_one_token_v1", "policy":"serial_interleaved_global_dedup_v1", "streams":streams,
         "purposes":purposes, "blocks":blocks, "limits":asdict(opts), "tokenizer_reference":asdict(ref),
         "tokenizer_manifest":ref.manifest_path, "task_budget":task.to_dict(), "probe_budget":probe.to_dict()}
+    if isinstance(opts, AlternatingSettings):
+        from lm_cl.data.alternating import configure_plan
+        configure_plan(plan, config)
     return plan, tokenizer
 
 

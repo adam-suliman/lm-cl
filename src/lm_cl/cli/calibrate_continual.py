@@ -31,6 +31,13 @@ def validate_window(config, *, warmup: int, batches: int, world_size: int) -> No
         raise ValueError("Warmup and stop must end at complete slow-update windows")
     if config.tasks[0].planned_logical_batches(config.optimization.global_sequences_per_logical_batch) < batches:
         raise ValueError("The first task does not contain the requested calibration batches")
+    if config.tasks[0].train_source.kind == "streaming_packed":
+        from lm_cl.data.streaming import source_from_pipeline, ALTERNATING_FORMAT
+        source = source_from_pipeline(config.tasks[0].train_source.packed)
+        if source.plan["format"] == ALTERNATING_FORMAT:
+            from lm_cl.data.alternating import control
+            if control(source.root, source.plan)["turn"] != 0 or batches > source.plan["alternation"]["turns"][0]["end_batches"]:
+                raise ValueError("Calibration must fit the initial alternating turn; use a fresh recipe and a larger chunk")
     if bool(config.distributed) != (world_size > 1):
         raise ValueError("Calibration GPU count differs from the config's distributed layout")
 

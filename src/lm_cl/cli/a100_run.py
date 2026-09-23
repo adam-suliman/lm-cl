@@ -24,6 +24,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--a100-memory-gb", type=int, choices=[40, 80], default=40)
     p.add_argument("--data-mode", choices=["streaming", "packed"], default="streaming")
     p.add_argument("--streaming-settings", help="JSON mapping of validated streaming resource settings")
+    p.add_argument("--streaming-schedule", choices=["independent", "alternating"], default="independent",
+                   help="independent trajectories or bounded alternating model/seed turns")
+    p.add_argument("--streaming-chunk-batches", type=int, default=None,
+                   help="maximum global logical batches per alternating turn (default 2048)")
     p.add_argument("--checkpoint-every-batches", type=int, default=0)
     p.add_argument("--data-root", default=os.environ.get("LM_CL_DATA_ROOT"))
     p.add_argument("--output-root", default=os.environ.get("LM_CL_OUTPUT_ROOT"))
@@ -101,7 +105,7 @@ def build_config(args):
                       if args.probe_training_manifest else
                       Path(config.data.generated_root) / "stages" /
                       f"zyphra-vi-probe-train-{probe_budget.effective_input_tokens}" / "manifest.json")
-    from lm_cl.launcher.streaming import StreamingSettings
+    from lm_cl.launcher.streaming import StreamingSettings, AlternatingSettings
     import json
     streaming = None
     if args.data_mode == "streaming":
@@ -109,9 +113,21 @@ def build_config(args):
             raise ValueError("Existing probe pools require --data-mode packed; streaming freezes a new paired study")
         if args.parallel_languages != 1:
             raise ValueError("Streaming uses one ordered producer; --parallel-languages must be 1")
-        streaming = asdict(StreamingSettings(**(json.loads(Path(args.streaming_settings).read_text()) if args.streaming_settings else {})))
+        values = json.loads(Path(args.streaming_settings).read_text()) if args.streaming_settings else {}
+        if "schedule" in values and values.pop("schedule") != args.streaming_schedule:
+            raise ValueError("Streaming JSON schedule differs from CLI selection")
+        if args.streaming_schedule == "alternating":
+            if args.streaming_chunk_batches is not None:
+                values["chunk_batches"] = args.streaming_chunk_batches
+            streaming = {**asdict(AlternatingSettings(**values)), "schedule": "alternating"}
+        else:
+            if args.streaming_chunk_batches is not None:
+                raise ValueError("Chunk size requires --streaming-schedule alternating")
+            streaming = asdict(StreamingSettings(**values))
     elif args.streaming_settings:
         raise ValueError("--streaming-settings requires streaming mode")
+    elif args.streaming_schedule != "independent" or args.streaming_chunk_batches is not None:
+        raise ValueError("Alternating schedule requires streaming data mode")
     config = replace(config, data=replace(config.data, mode=args.data_mode, streaming=streaming, dataset_cache_root=str(cache),
                      probe_training_manifest=str(probe_manifest),
                      prepare_if_missing=args.action in {"prepare", "run", "calibrate"} and not args.dry_run),
@@ -187,6 +203,7 @@ def command(argv: Sequence[str] | None = None) -> None:
                                   policy=config.experiment.token_budget_policy)
     if action == "plan":
         print_json({"status": "configuration_validated_only", "data_or_gpu_validation_performed": False,
+                    "streaming_schedule": args.streaming_schedule,
                     "production_data_route": config.data.mode,
                     "incremental_block_production_launch_supported": True,
                     "a100_memory_gb_requested": args.a100_memory_gb,
