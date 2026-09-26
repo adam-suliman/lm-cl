@@ -98,7 +98,7 @@ def _existing_resolved(path: Path) -> dict[str, Any] | None:
     return value
 
 
-def _checkpoint_estimate(config: LauncherConfig, job_count: int) -> dict[str, int]:
+def _checkpoint_estimate(config: LauncherConfig, job_count: int) -> dict[str, int | str]:
     model = _model_config(config)
     per_checkpoint = (
         model.expected_total_parameters
@@ -134,11 +134,19 @@ def _checkpoint_estimate(config: LauncherConfig, job_count: int) -> dict[str, in
             task_batches = ceil(count / config.training.global_batch_sequences)
             turn_checkpoints = config.experiment.cycles * len(PUBLIC_LANGUAGE_ORDER) * ((task_batches - 1) // limits.chunk_batches)
     per_job_count = continual_checkpoints + probe_checkpoints + periodic + turn_checkpoints
+    retention = config.data.streaming.get("checkpoint_retention") if config.data.streaming else None
+    if retention == "cycle_end_v1":
+        # Per completed cycle: immutable Russian probe source, augmented
+        # resume checkpoint, and completed Vietnamese probe checkpoint. Three
+        # additional file allowances cover a live language checkpoint,
+        # transition overlap, and an atomic write in progress.
+        per_job_count = config.experiment.cycles * (2 + int(config.probe.enabled)) + 3
     return {
         "estimated_bytes_per_checkpoint": per_checkpoint,
         "estimated_periodic_checkpoints_per_job": periodic,
         "estimated_alternating_turn_checkpoints_per_job": turn_checkpoints,
         "estimated_checkpoints_per_job": per_job_count,
+        "checkpoint_retention": retention or "all",
         "estimated_bytes_per_job": per_checkpoint * per_job_count,
         "estimated_total_checkpoint_bytes": (
             per_checkpoint * per_job_count * job_count

@@ -55,8 +55,11 @@ class AlternatingSettings(StreamingSettings):
 def settings_from_mapping(mapping):
     values = dict(mapping or {})
     schedule = values.pop("schedule", "independent")
+    retention = values.pop("checkpoint_retention", None)
     if schedule not in {"independent", "alternating"}:
         raise ValueError("Unknown streaming schedule")
+    if retention not in {None, "cycle_end_v1"} or (retention and schedule != "alternating"):
+        raise ValueError("Invalid streaming checkpoint-retention policy")
     return (AlternatingSettings if schedule == "alternating" else StreamingSettings)(**values)
 
 
@@ -108,6 +111,8 @@ def _plan(config):
     plan = {"format":FORMAT, "final_document_remainder":"eos_only_if_one_token_v1", "policy":"serial_interleaved_global_dedup_v1", "streams":streams,
         "purposes":purposes, "blocks":blocks, "limits":asdict(opts), "tokenizer_reference":asdict(ref),
         "tokenizer_manifest":ref.manifest_path, "task_budget":task.to_dict(), "probe_budget":probe.to_dict()}
+    if config.data.streaming.get("checkpoint_retention") == "cycle_end_v1":
+        plan["checkpoint_retention"] = "cycle_end_v1"
     if isinstance(opts, AlternatingSettings):
         from lm_cl.data.alternating import configure_plan
         configure_plan(plan, config)

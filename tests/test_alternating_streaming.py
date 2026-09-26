@@ -248,6 +248,28 @@ def test_cli_selection_and_queue_capacity(tmp_path):
         replace(current, data=replace(current.data, streaming={**current.data.streaming, "token_cache_bytes": 128 * 1024**2})).validate()
 
 
+def test_cycle_checkpoint_retention_contract_and_estimate(tmp_path):
+    from lm_cl.cli.a100_run import parser, build_config
+    from lm_cl.launcher.scheduler import _checkpoint_estimate
+    args = ["--model-size", "5m", "--data-root", str(tmp_path / "data"),
+            "--output-root", str(tmp_path / "out")]
+    base = build_config(parser().parse_args([*args, "--streaming-schedule", "alternating"]))
+    assert "checkpoint_retention" not in base.data.streaming
+    retained = build_config(parser().parse_args([*args, "--streaming-schedule", "alternating",
+                                                 "--checkpoint-retention", "cycle"]))
+    assert retained.data.streaming["checkpoint_retention"] == "cycle_end_v1"
+    assert _checkpoint_estimate(retained, 2)["estimated_checkpoints_per_job"] == 18
+    for additions, message in [
+        (["--checkpoint-retention", "cycle"], "requires alternating"),
+        (["--streaming-schedule", "alternating", "--checkpoint-retention", "cycle",
+          "--streaming-chunk-batches", "512"], "one turn per language"),
+        (["--streaming-schedule", "alternating", "--checkpoint-retention", "cycle",
+          "--checkpoint-every-batches", "10"], "no periodic saves"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            build_config(parser().parse_args([*args, *additions]))
+
+
 def test_preflight_counts_pinned_data_separately(tmp_path, monkeypatch):
     from types import SimpleNamespace
     import lm_cl.launcher.scheduler as module
@@ -382,3 +404,63 @@ def test_real_job_runner_pair_two_cycles_matches_independent_with_pinned_data(tm
     with connect(reference_root) as db:
         old_bytes = db.execute("SELECT SUM(length(record)+length(state)) FROM receipts").fetchone()[0]
     assert compact_bytes < old_bytes / 4  # Detailed state no longer grows per block.
+
+
+def test_cycle_retention_keeps_probe_sources_and_recovers_after_ledger_crash(tmp_path, monkeypatch):
+    from lm_cl.launcher.runner import run_resolved_job, StageProcessController
+    from lm_cl.launcher.scheduler import allocate_job_slots, _checkpoint_estimate
+    import lm_cl.launcher.alternating as scheduling
+    import lm_cl.launcher.checkpoint_retention as retention
+
+    cfg, _, _ = alternating(tmp_path, monkeypatch, chunks=3, cycles=2)
+    cfg = replace(cfg, data=replace(cfg.data, streaming={**cfg.data.streaming,
+        "checkpoint_retention": "cycle_end_v1"}))
+    cfg.validate()
+    contract = resolve_streaming_contract(cfg, prepare=True)
+    root = Path(contract["streaming_root"])
+    plan = load_plan(root)
+    assert plan["checkpoint_retention"] == "cycle_end_v1"
+    assert _checkpoint_estimate(cfg, 2)["estimated_checkpoints_per_job"] == 9
+    tiny_probe_vocabulary(monkeypatch)
+    monkeypatch.setattr(StageProcessController, "run", inline_stage)
+    jobs = launcher_jobs.expand_job_specs(cfg, contract)
+    for job in jobs:
+        launcher_jobs.write_resolved_job(job)
+
+    def run_turn(scheduler):
+        return [run_resolved_job(Path(a.output_dir) / "resolved_experiment.yaml",
+                                rendezvous_port=a.rendezvous_port, retry_resume=True,
+                                alternating_turn=int(a.command[a.command.index("--alternating-turn") + 1]))
+                for a in scheduler.assignments]
+    monkeypatch.setattr(scheduling.TurnScheduler, "run", run_turn)
+    original = retention.atomic_write_json
+    crashed = False
+    def crash_after_retirement_record(path, value):
+        nonlocal crashed
+        original(path, value)
+        if Path(path).name == "checkpoint_retention.json" and not crashed:
+            crashed = True
+            raise InterruptedError("after durable retirement record")
+    monkeypatch.setattr(retention, "atomic_write_json", crash_after_retirement_record)
+    with producer(root), pytest.raises(InterruptedError, match="retirement record"):
+        scheduling.run_alternating(cfg, jobs, allocate_job_slots(cfg, jobs))
+    assert crashed and control(root, plan)["turn"] == 2
+    assert (Path(jobs[0].output_dir) / "checkpoints/task-0000-en-boundary.pt").exists()
+    monkeypatch.setattr(retention, "atomic_write_json", original)
+    with producer(root):
+        summaries = scheduling.run_alternating(cfg, jobs, allocate_job_slots(cfg, jobs))
+    assert all(s["status"] == "complete" for s in summaries)
+    for job, summary in zip(jobs, summaries):
+        directory = Path(job.output_dir)
+        names = {p.name for p in (directory / "checkpoints").glob("*.pt")}
+        assert names == {"task-0007-ru-boundary.pt", "cycle-0001-complete.pt",
+                         "task-0015-ru-boundary.pt", "cycle-0002-complete.pt"}
+        assert summary["final_checkpoint_path"] == str(directory / "checkpoints/cycle-0002-complete.pt")
+        for cycle, probe in enumerate(summary["per_cycle_probe_auc"], 1):
+            source = probe["source_checkpoint"]["path"]
+            assert Path(source).name == f"task-{cycle * 8 - 1:04d}-ru-boundary.pt"
+            assert Path(source).is_file()
+        assert len(list((directory / "probes").rglob("probe-complete-step-*.pt"))) == 2
+        ledger = json.loads((directory / "checkpoint_retention.json").read_text())
+        assert len(ledger["retired"]) == 14
+        assert all(value["sha256"] for value in ledger["retired"].values())

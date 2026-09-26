@@ -17,7 +17,19 @@ finish the original derived Vietnamese probe and cycle summary.
 The default maximum is 2048 logical batches, so the default 1B-token task fits
 in one turn. This avoids extra mid-task checkpoints at that budget. Smaller
 turns are configurable and require additional retained checkpoints; their disk
-cost must appear in preflight. No checkpoint is automatically deleted.
+cost must appear in preflight. The default `all` policy keeps every checkpoint.
+
+An opt-in `--checkpoint-retention cycle` policy for new recipes retires earlier
+non-Russian task-boundary files after a full turn has been acknowledged by all
+consumers and the queue release watermark has advanced. The latest recovery
+checkpoint remains while a cycle is in progress. At each cycle end, the raw
+Russian checkpoint remains as the Vietnamese probe's immutable source, the
+augmented cycle checkpoint remains as the resume/evidence state, and the
+completed probe checkpoint remains. A durable job-local ledger records the
+SHA-256 of each retired path before removal. This policy requires one turn per
+language and no periodic saves. The default `all` policy above is unchanged;
+the retention choice is frozen into the streaming recipe and cannot change on
+resume.
 
 Vietnamese training and all fixed validation blocks are permanently pinned when
 first produced. Continual blocks occupy a separately bounded queue. The producer

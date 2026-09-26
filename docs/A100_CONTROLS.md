@@ -113,12 +113,30 @@ consumer finishes the turn before the queue advances. The default maximum is
 At the default 1B-token task budget, this means one language task per turn and
 no additional mid-task checkpoints.
 
+For a **fresh alternating study**, add `--checkpoint-retention cycle` to every
+`plan`, `prepare`, `preflight`, `run`, and resume command. The default is `all`.
+Cycle retention temporarily keeps the latest language-boundary checkpoint so
+every consumer can resume and acknowledge its data. After the queue advances,
+older non-Russian language checkpoints are retired, with their paths and
+SHA-256 hashes recorded in each job's `checkpoint_retention.json`. Each raw
+Russian boundary checkpoint remains as the immutable Vietnamese probe source;
+each augmented cycle checkpoint and completed probe checkpoint also remains.
+This is a retention policy: training still writes temporary checkpoints inside
+a cycle. It requires one turn per language and no periodic saves. The frozen
+recipe prevents switching retention on resume. Existing studies are untouched.
+
+For 5M, cycle retention reserves about **74.36 GiB** for two models at one seed
+or **112.90 GiB** for two models at two seeds on one filesystem. The estimate
+includes three transient-checkpoint allowances per job and the 20 GiB free
+floor; installation, logs, downloads and failed attempts need more headroom.
+
 `--streaming-chunk-batches 512` requests smaller turns (up to 1 GiB of uint32
 training tokens at the default batch/sequence sizes). Each extra mid-task turn
 saves a retained resume checkpoint, including partial-K gradients and memory.
 For five cycles this setting adds 120 checkpoints per model/seed; it can make
 total disk usage larger despite the smaller data queue. Preflight counts these
-files. No checkpoint is automatically deleted.
+files. This smaller-turn setting is incompatible with cycle retention, so its
+checkpoints remain until separately reviewed.
 
 The alternating defaults use a 4 GiB continual-data queue, an 8 GiB metadata
 cap, and separately pinned Vietnamese/fixed validation data (about 3.813 GiB
@@ -168,7 +186,7 @@ retain all 41B unique uint32 training/probe tokens. Metadata has a separate
 **64 GiB cap** (a ceiling, not predicted use); tokenizer cache and checkpoints
 are additional. Preflight includes cache/metadata reservation and checkpoint
 estimates and keeps a 20 GiB free-space floor. Logs and failed attempts also
-consume space. No checkpoints are automatically deleted.
+consume space. The default `all` retention policy does not delete checkpoints.
 
 For the default two-model, one-seed, five-cycle study, the conservative current
 admission estimates on one filesystem are:
@@ -209,6 +227,7 @@ them. The model size is selected by the script.
 | `--name` | Unique experiment name; otherwise derived from model/layout/budget |
 | `--resume` | `never` (default), `auto`, or `required` |
 | `--checkpoint-every-batches` | Additional periodic saves; 0 disables only periodic saves |
+| `--checkpoint-retention` | `all` (default) or `cycle` for a fresh alternating study |
 | `--data-root` / `--output-root` | Override `LM_CL_DATA_ROOT` / `LM_CL_OUTPUT_ROOT` |
 | `--cache-root` | Tokenizer/HF cache path; defaults inside the data root |
 | `--parallel-languages` | Legacy preparation parallelism; streaming requires 1 |

@@ -29,6 +29,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--streaming-chunk-batches", type=int, default=None,
                    help="maximum global logical batches per alternating turn (default 2048)")
     p.add_argument("--checkpoint-every-batches", type=int, default=0)
+    p.add_argument("--checkpoint-retention", choices=["all", "cycle"], default="all",
+                   help="retain all checkpoints or only durable cycle/probe sources plus the current recovery point")
     p.add_argument("--data-root", default=os.environ.get("LM_CL_DATA_ROOT"))
     p.add_argument("--output-root", default=os.environ.get("LM_CL_OUTPUT_ROOT"))
     p.add_argument("--cache-root", default=None)
@@ -114,18 +116,26 @@ def build_config(args):
         if args.parallel_languages != 1:
             raise ValueError("Streaming uses one ordered producer; --parallel-languages must be 1")
         values = json.loads(Path(args.streaming_settings).read_text()) if args.streaming_settings else {}
+        if "checkpoint_retention" in values:
+            raise ValueError("Select checkpoint retention with --checkpoint-retention, not --streaming-settings")
         if "schedule" in values and values.pop("schedule") != args.streaming_schedule:
             raise ValueError("Streaming JSON schedule differs from CLI selection")
         if args.streaming_schedule == "alternating":
             if args.streaming_chunk_batches is not None:
                 values["chunk_batches"] = args.streaming_chunk_batches
             streaming = {**asdict(AlternatingSettings(**values)), "schedule": "alternating"}
+            if args.checkpoint_retention == "cycle":
+                streaming["checkpoint_retention"] = "cycle_end_v1"
         else:
+            if args.checkpoint_retention != "all":
+                raise ValueError("Cycle checkpoint retention requires alternating streaming")
             if args.streaming_chunk_batches is not None:
                 raise ValueError("Chunk size requires --streaming-schedule alternating")
             streaming = asdict(StreamingSettings(**values))
     elif args.streaming_settings:
         raise ValueError("--streaming-settings requires streaming mode")
+    elif args.checkpoint_retention != "all":
+        raise ValueError("Cycle checkpoint retention requires alternating streaming")
     elif args.streaming_schedule != "independent" or args.streaming_chunk_batches is not None:
         raise ValueError("Alternating schedule requires streaming data mode")
     config = replace(config, data=replace(config.data, mode=args.data_mode, streaming=streaming, dataset_cache_root=str(cache),

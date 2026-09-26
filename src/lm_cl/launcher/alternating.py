@@ -6,6 +6,7 @@ from pathlib import Path
 from lm_cl.data.alternating import acknowledge, advance, control, recover_release
 from lm_cl.data.streaming import load_plan
 from lm_cl.launcher.scheduler import LocalJobScheduler
+from lm_cl.launcher.checkpoint_retention import retire_completed_turn_checkpoints
 
 
 class TurnScheduler(LocalJobScheduler):
@@ -19,6 +20,7 @@ def run_alternating(config, jobs, assignments):
     if {job.job_id for job in jobs} != expected:
         raise ValueError("Alternating consumer set changed")
     recover_release(root, plan)
+    retire_completed_turn_checkpoints(root, plan, jobs)
     while True:
         state = control(root, plan)
         index = state["turn"]
@@ -42,6 +44,7 @@ def run_alternating(config, jobs, assignments):
                 acknowledge(root, consumer, result["final_checkpoint_path"], result["final_checkpoint_sha256"])
         if not advance(root):
             raise RuntimeError("Alternating turn lacks verified consumer checkpoints")
+        retire_completed_turn_checkpoints(root, plan, jobs)
     summaries = [json.loads((Path(job.output_dir) / "summary.json").read_text()) for job in jobs]
     if any(value.get("status") != "complete" for value in summaries):
         raise ValueError("Queue completion without complete experiment summaries")

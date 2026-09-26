@@ -592,6 +592,10 @@ class LauncherConfig:
                 from math import ceil
                 task = resolve_token_budget(self.experiment.tokens_per_task, self.experiment.sequence_length,
                                             policy=self.experiment.token_budget_policy).effective_input_tokens
+                if self.data.streaming.get("checkpoint_retention") == "cycle_end_v1":
+                    task_batches = ceil(task / (self.training.global_batch_sequences * self.experiment.sequence_length))
+                    if self.training.checkpoint_frequency or limits.chunk_batches < task_batches:
+                        raise ValueError("Cycle checkpoint retention requires no periodic saves and one turn per language task")
                 turn = min(task, limits.chunk_batches * self.training.global_batch_sequences * self.experiment.sequence_length)
                 # One extra block covers a turn beginning inside a prior block.
                 if (ceil(turn / limits.block_tokens) + 1) * limits.block_tokens * 4 > limits.token_cache_bytes:

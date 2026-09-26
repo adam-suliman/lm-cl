@@ -57,6 +57,10 @@ def validate_plan(plan):
     if (plan["format"] not in {FORMAT, ALTERNATING_FORMAT} or plan["policy"] != "serial_interleaved_global_dedup_v1"
             or plan["final_document_remainder"] != "eos_only_if_one_token_v1"):
         raise ValueError("Unknown streaming preparation policy/version")
+    if (plan.get("checkpoint_retention") not in {None, "cycle_end_v1"}
+            or (plan.get("checkpoint_retention") is not None
+                and plan["format"] != ALTERNATING_FORMAT)):
+        raise ValueError("Unknown streaming checkpoint-retention policy")
     offsets = {}
     for name, spec in plan["streams"].items():
         recipe = Recipe(**spec)
